@@ -3,6 +3,7 @@ package bullmq
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -373,6 +374,61 @@ func (q *Queue) RemoveRateLimitKey(ctx context.Context) (int64, error) {
 // GetRateLimitTtl returns the ms until the rate limit lifts (0 if not limited).
 func (q *Queue) GetRateLimitTtl(ctx context.Context, maxJobs int) (int64, error) {
 	return q.scripts.getRateLimitTtl(ctx, maxJobs)
+}
+
+// ── Workers discovery & deduplication ────────────────────────────────────
+
+// GetWorkers returns the workers connected to this queue, parsed from CLIENT LIST.
+// Workers register a client name via CLIENT SETNAME; providers that block those
+// commands yield an empty list.
+func (q *Queue) GetWorkers(ctx context.Context) ([]map[string]string, error) {
+	list, err := q.conn.client.Do(ctx, "CLIENT", "LIST").Text()
+	if err != nil {
+		return nil, nil // best-effort: CLIENT LIST may be unavailable
+	}
+	return parseClientList(list, q.keys.ClientName("")), nil
+}
+
+// GetWorkersCount returns how many workers are connected to this queue.
+func (q *Queue) GetWorkersCount(ctx context.Context) (int, error) {
+	workers, err := q.GetWorkers(ctx)
+	return len(workers), err
+}
+
+// GetDeduplicationJobID returns the job id currently holding a deduplication id,
+// or "" if none.
+func (q *Queue) GetDeduplicationJobID(ctx context.Context, id string) (string, error) {
+	v, err := q.conn.client.Get(ctx, q.keys.Get("de")+":"+id).Result()
+	if err == redis.Nil {
+		return "", nil
+	}
+	return v, err
+}
+
+// RemoveDeduplicationKey clears a deduplication id, returning the keys removed.
+func (q *Queue) RemoveDeduplicationKey(ctx context.Context, id string) (int64, error) {
+	return q.conn.client.Del(ctx, q.keys.Get("de")+":"+id).Result()
+}
+
+// parseClientList extracts CLIENT LIST rows whose name matches this queue's
+// worker-client prefix.
+func parseClientList(list, prefix string) []map[string]string {
+	var out []map[string]string
+	for _, line := range strings.Split(strings.TrimSpace(list), "\n") {
+		if line == "" {
+			continue
+		}
+		fields := make(map[string]string)
+		for _, kv := range strings.Fields(line) {
+			if k, v, ok := strings.Cut(kv, "="); ok {
+				fields[k] = v
+			}
+		}
+		if strings.HasPrefix(fields["name"], prefix) {
+			out = append(out, fields)
+		}
+	}
+	return out
 }
 
 // Name returns the queue name.

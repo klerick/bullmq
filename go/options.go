@@ -11,11 +11,14 @@ type config struct {
 	redisOptions   *redis.Options
 
 	// worker-only
-	concurrency     int
-	lockDuration    int64 // milliseconds
-	stalledInterval int64 // milliseconds
-	maxStalledCount int
-	limiter         *Limiter
+	concurrency      int
+	lockDuration     int64 // milliseconds
+	stalledInterval  int64 // milliseconds
+	maxStalledCount  int
+	limiter          *Limiter
+	workerName       string
+	skipStalledCheck bool
+	skipLockRenewal  bool
 }
 
 // Limiter rate-limits a worker to Max jobs per Duration (milliseconds).
@@ -77,6 +80,21 @@ func WithMaxStalledCount(n int) Option {
 // WithLimiter rate-limits the worker to max jobs per durationMs milliseconds.
 func WithLimiter(max int, durationMs int64) Option {
 	return func(cfg *config) { cfg.limiter = &Limiter{Max: max, Duration: durationMs} }
+}
+
+// WithWorkerName names the worker so Queue.GetWorkers can identify it.
+func WithWorkerName(name string) Option {
+	return func(cfg *config) { cfg.workerName = name }
+}
+
+// WithSkipStalledCheck disables the worker's stalled-job recovery loop.
+func WithSkipStalledCheck() Option {
+	return func(cfg *config) { cfg.skipStalledCheck = true }
+}
+
+// WithSkipLockRenewal disables the worker's lock-renewal loop.
+func WithSkipLockRenewal() Option {
+	return func(cfg *config) { cfg.skipLockRenewal = true }
 }
 
 // newConfig applies options over the defaults.

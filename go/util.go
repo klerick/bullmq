@@ -27,6 +27,25 @@ func toInt64(v any) int64 {
 	}
 }
 
+// toFloat64 coerces a value into a float64.
+func toFloat64(v any) float64 {
+	switch n := v.(type) {
+	case float64:
+		return n
+	case float32:
+		return float64(n)
+	case int64:
+		return float64(n)
+	case int:
+		return float64(n)
+	case string:
+		f, _ := strconv.ParseFloat(n, 64)
+		return f
+	default:
+		return 0
+	}
+}
+
 // toStr coerces a Redis/msgpack value into a string.
 func toStr(v any) string {
 	switch s := v.(type) {

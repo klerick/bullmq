@@ -27,15 +27,18 @@ type Processor func(ctx context.Context, job *Job) (any, error)
 // with NewWorker and the same functional options as Queue, plus WithConcurrency /
 // WithLockDuration.
 type Worker struct {
-	queue           *Queue
-	processor       Processor
-	concurrency     int
-	lockDuration    int64
-	stalledInterval int64
-	maxStalledCount int
-	limiter         *Limiter
-	drainDelay      time.Duration
-	id              string
+	queue            *Queue
+	processor        Processor
+	concurrency      int
+	lockDuration     int64
+	stalledInterval  int64
+	maxStalledCount  int
+	limiter          *Limiter
+	workerName       string
+	skipStalledCheck bool
+	skipLockRenewal  bool
+	drainDelay       time.Duration
+	id               string
 
 	drained    bool
 	blockUntil int64
@@ -69,30 +72,42 @@ func NewWorker(name string, processor Processor, opts ...Option) (*Worker, error
 		maxStalledCount = defaultMaxStalledCount
 	}
 	return &Worker{
-		queue:           q,
-		processor:       processor,
-		concurrency:     concurrency,
-		lockDuration:    lockDuration,
-		stalledInterval: stalledInterval,
-		maxStalledCount: maxStalledCount,
-		limiter:         cfg.limiter,
-		drainDelay:      defaultDrainDelay,
-		id:              genID(),
-		drained:         true,
-		active:          make(map[string]string),
+		queue:            q,
+		processor:        processor,
+		concurrency:      concurrency,
+		lockDuration:     lockDuration,
+		stalledInterval:  stalledInterval,
+		maxStalledCount:  maxStalledCount,
+		limiter:          cfg.limiter,
+		workerName:       cfg.workerName,
+		skipStalledCheck: cfg.skipStalledCheck,
+		skipLockRenewal:  cfg.skipLockRenewal,
+		drainDelay:       defaultDrainDelay,
+		id:               genID(),
+		drained:          true,
+		active:           make(map[string]string),
 	}, nil
 }
 
 // Run processes jobs until ctx is cancelled. It blocks, so callers typically run
 // it in a goroutine. In-flight jobs are awaited before Run returns.
 func (w *Worker) Run(ctx context.Context) error {
+	// Register a client name so Queue.GetWorkers can discover this worker
+	// (best-effort; some managed Redis providers reject CLIENT SETNAME).
+	w.ensureClientName(ctx)
+
 	sem := make(chan struct{}, w.concurrency)
 	var wg sync.WaitGroup
 
 	// Background maintenance: renew locks of active jobs, and recover stalled ones.
-	wg.Add(2)
-	go func() { defer wg.Done(); w.lockRenewalLoop(ctx) }()
-	go func() { defer wg.Done(); w.stalledCheckLoop(ctx) }()
+	if !w.skipLockRenewal {
+		wg.Add(1)
+		go func() { defer wg.Done(); w.lockRenewalLoop(ctx) }()
+	}
+	if !w.skipStalledCheck {
+		wg.Add(1)
+		go func() { defer wg.Done(); w.stalledCheckLoop(ctx) }()
+	}
 
 	seq := 0
 
@@ -285,6 +300,18 @@ func (w *Worker) stalledCheckLoop(ctx context.Context) {
 			_, _ = w.queue.scripts.moveStalledJobsToWait(ctx, w.maxStalledCount, w.stalledInterval)
 		}
 	}
+}
+
+// ensureClientName sets a CLIENT SETNAME on the worker's connections so
+// Queue.GetWorkers can find it via CLIENT LIST. Best-effort.
+func (w *Worker) ensureClientName(ctx context.Context) {
+	suffix := ""
+	if w.workerName != "" {
+		suffix = ":w:" + w.workerName
+	}
+	name := w.queue.keys.ClientName(suffix)
+	_ = w.queue.conn.blockingClient.Do(ctx, "CLIENT", "SETNAME", name).Err()
+	_ = w.queue.conn.client.Do(ctx, "CLIENT", "SETNAME", name).Err()
 }
 
 // Close stops using resources, closing only clients the worker owns.
