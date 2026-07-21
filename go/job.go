@@ -270,6 +270,28 @@ func (j *Job) GetDependenciesCount(ctx context.Context) (int64, error) {
 	return counts[0], nil
 }
 
+// GetState returns the job's current state.
+func (j *Job) GetState(ctx context.Context) (string, error) {
+	return j.queue.scripts.getState(ctx, j.ID)
+}
+
+func (j *Job) IsCompleted(ctx context.Context) (bool, error) { return j.stateIs(ctx, "completed") }
+func (j *Job) IsFailed(ctx context.Context) (bool, error)    { return j.stateIs(ctx, "failed") }
+func (j *Job) IsDelayed(ctx context.Context) (bool, error)   { return j.stateIs(ctx, "delayed") }
+func (j *Job) IsActive(ctx context.Context) (bool, error)    { return j.stateIs(ctx, "active") }
+func (j *Job) IsWaiting(ctx context.Context) (bool, error)   { return j.stateIs(ctx, "waiting") }
+func (j *Job) IsWaitingChildren(ctx context.Context) (bool, error) {
+	return j.stateIs(ctx, "waiting-children")
+}
+
+func (j *Job) stateIs(ctx context.Context, want string) (bool, error) {
+	state, err := j.GetState(ctx)
+	if err != nil {
+		return false, err
+	}
+	return state == want, nil
+}
+
 // decodeOpts rewrites short stored option keys back to their long form,
 // mirroring python job.py optsFromJSON.
 func decodeOpts(opts map[string]any) map[string]any {

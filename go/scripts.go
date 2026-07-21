@@ -483,6 +483,108 @@ func (s *scripts) moveStalledJobsToWait(ctx context.Context, maxStalledCount int
 	return out, nil
 }
 
+// transformStateType maps the public "waiting" type to its Redis key suffix "wait".
+func transformStateType(t string) string {
+	if t == "waiting" {
+		return "wait"
+	}
+	return t
+}
+
+// getCounts returns the job count for each requested type. From getCounts-1.lua.
+func (s *scripts) getCounts(ctx context.Context, types []string) ([]int64, error) {
+	keys := []string{s.keys.KeyPrefix()}
+	args := make([]any, len(types))
+	for i, t := range types {
+		args[i] = transformStateType(t)
+	}
+	res, err := s.run(ctx, "getCounts", keys, args...)
+	if err != nil {
+		return nil, err
+	}
+	arr, _ := res.([]any)
+	out := make([]int64, len(arr))
+	for i, v := range arr {
+		out[i] = toInt64(v)
+	}
+	return out, nil
+}
+
+// getState returns a job's state ("completed", "failed", "delayed", "prioritized",
+// "active", "waiting", "waiting-children", "unknown"). Uses getStateV2 (Redis >= 6.0.6).
+func (s *scripts) getState(ctx context.Context, jobID string) (string, error) {
+	keys := []string{
+		s.keys.Completed(), s.keys.Failed(), s.keys.Delayed(), s.keys.Active(),
+		s.keys.Wait(), s.keys.Paused(), s.keys.WaitingChildren(), s.keys.Prioritized(),
+	}
+	args := []any{jobID, s.keys.JobKey(jobID)}
+	res, err := s.run(ctx, "getStateV2", keys, args...)
+	if err != nil {
+		return "", err
+	}
+	return toStr(res), nil
+}
+
+// getRanges returns the job ids in each requested state's list/zset within
+// [start, end]. From getRanges-1.lua.
+func (s *scripts) getRanges(ctx context.Context, types []string, start, end int64, asc bool) ([][]string, error) {
+	ascStr := "0"
+	if asc {
+		ascStr = "1"
+	}
+	args := []any{start, end, ascStr}
+	for _, t := range types {
+		args = append(args, transformStateType(t))
+	}
+	res, err := s.run(ctx, "getRanges", []string{s.keys.KeyPrefix()}, args...)
+	if err != nil {
+		return nil, err
+	}
+	arr, _ := res.([]any)
+	out := make([][]string, len(arr))
+	for i, e := range arr {
+		ids, _ := e.([]any)
+		out[i] = make([]string, len(ids))
+		for j, id := range ids {
+			out[i][j] = toStr(id)
+		}
+	}
+	return out, nil
+}
+
+// getCountsPerPriority returns the job count for each requested priority.
+// From getCountsPerPriority-4.lua.
+func (s *scripts) getCountsPerPriority(ctx context.Context, priorities []int) ([]int64, error) {
+	keys := []string{s.keys.Wait(), s.keys.Paused(), s.keys.Meta(), s.keys.Prioritized()}
+	args := make([]any, len(priorities))
+	for i, p := range priorities {
+		args[i] = p
+	}
+	res, err := s.run(ctx, "getCountsPerPriority", keys, args...)
+	if err != nil {
+		return nil, err
+	}
+	arr, _ := res.([]any)
+	out := make([]int64, len(arr))
+	for i, v := range arr {
+		out[i] = toInt64(v)
+	}
+	return out, nil
+}
+
+// isMaxed reports whether the queue has reached its concurrency/limit ceiling.
+// From isMaxed-2.lua (Lua false comes back as nil).
+func (s *scripts) isMaxed(ctx context.Context) (bool, error) {
+	res, err := s.run(ctx, "isMaxed", []string{s.keys.Meta(), s.keys.Active()})
+	if err == redis.Nil { // Lua `false` comes back as a RESP nil
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return toInt64(res) == 1, nil
+}
+
 // getKeepJobs normalises removeOnComplete/removeOnFail into the {count|age|...}
 // map the Lua expects. Mirrors python scripts.py::getKeepJobs.
 func getKeepJobs(shouldRemove any) map[string]any {
