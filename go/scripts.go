@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+
+	"github.com/redis/go-redis/v9"
 )
 
 // scripts is the bindings layer: it assembles KEYS/ARGV for each Lua command,
@@ -92,28 +94,57 @@ func (s *scripts) addJob(ctx context.Context, job *Job) (string, error) {
 	}
 }
 
-func (s *scripts) addStandardJob(ctx context.Context, job *Job) (string, error) {
-	keys := []string{
+// Key lists per add-script (KEYS order is the cross-port contract).
+func (s *scripts) standardJobKeys() []string {
+	return []string{
 		s.keys.Wait(), s.keys.Paused(), s.keys.Meta(), s.keys.ID(),
 		s.keys.Completed(), s.keys.Delayed(), s.keys.Active(), s.keys.Events(), s.keys.Marker(),
 	}
-	return s.execAdd(ctx, "addStandardJob", keys, job)
 }
 
-func (s *scripts) addDelayedJob(ctx context.Context, job *Job) (string, error) {
-	keys := []string{
+func (s *scripts) delayedJobKeys() []string {
+	return []string{
 		s.keys.Marker(), s.keys.Meta(), s.keys.ID(),
 		s.keys.Delayed(), s.keys.Completed(), s.keys.Events(),
 	}
-	return s.execAdd(ctx, "addDelayedJob", keys, job)
 }
 
-func (s *scripts) addPrioritizedJob(ctx context.Context, job *Job) (string, error) {
-	keys := []string{
+func (s *scripts) prioritizedJobKeys() []string {
+	return []string{
 		s.keys.Marker(), s.keys.Meta(), s.keys.ID(), s.keys.Prioritized(),
 		s.keys.Delayed(), s.keys.Completed(), s.keys.Active(), s.keys.Events(), s.keys.PC(),
 	}
-	return s.execAdd(ctx, "addPrioritizedJob", keys, job)
+}
+
+func (s *scripts) parentJobKeys() []string {
+	return []string{
+		s.keys.Meta(), s.keys.ID(), s.keys.Delayed(),
+		s.keys.WaitingChildren(), s.keys.Completed(), s.keys.Events(),
+	}
+}
+
+// addJobScript picks the add-script name and keys for a leaf job.
+func (s *scripts) addJobScript(job *Job) (string, []string) {
+	switch {
+	case job.Delay > 0:
+		return "addDelayedJob", s.delayedJobKeys()
+	case job.Priority > 0:
+		return "addPrioritizedJob", s.prioritizedJobKeys()
+	default:
+		return "addStandardJob", s.standardJobKeys()
+	}
+}
+
+func (s *scripts) addStandardJob(ctx context.Context, job *Job) (string, error) {
+	return s.execAdd(ctx, "addStandardJob", s.standardJobKeys(), job)
+}
+
+func (s *scripts) addDelayedJob(ctx context.Context, job *Job) (string, error) {
+	return s.execAdd(ctx, "addDelayedJob", s.delayedJobKeys(), job)
+}
+
+func (s *scripts) addPrioritizedJob(ctx context.Context, job *Job) (string, error) {
+	return s.execAdd(ctx, "addPrioritizedJob", s.prioritizedJobKeys(), job)
 }
 
 func (s *scripts) execAdd(ctx context.Context, script string, keys []string, job *Job) (string, error) {
@@ -126,6 +157,27 @@ func (s *scripts) execAdd(ctx context.Context, script string, keys []string, job
 		return "", err
 	}
 	return parseAddResult(res, job.ParentKey)
+}
+
+// enqueueAddJob queues a leaf-job add on the given scripter (e.g. a pipeline) and
+// returns the pending command; the result is read after the pipeline executes.
+func (s *scripts) enqueueAddJob(ctx context.Context, scripter redis.Scripter, job *Job) (*redis.Cmd, error) {
+	args, err := s.addJobArgs(job)
+	if err != nil {
+		return nil, err
+	}
+	name, keys := s.addJobScript(job)
+	return s.conn.scripts[name].Run(ctx, scripter, keys, args...), nil
+}
+
+// enqueueAddParentJob queues a parent-job add (goes into waiting-children) on the
+// given scripter.
+func (s *scripts) enqueueAddParentJob(ctx context.Context, scripter redis.Scripter, job *Job) (*redis.Cmd, error) {
+	args, err := s.addJobArgs(job)
+	if err != nil {
+		return nil, err
+	}
+	return s.conn.scripts["addParentJob"].Run(ctx, scripter, s.parentJobKeys(), args...), nil
 }
 
 // parseAddResult turns an add-script reply into a job id, or a typed error for a
@@ -320,6 +372,72 @@ func (s *scripts) retryJob(ctx context.Context, jobID string, lifo bool, token s
 	}
 	if code, ok := res.(int64); ok && code < 0 {
 		return finishedError(ScriptErrorCode(code), errorContext{jobID: jobID, command: "retryJob", state: "active"})
+	}
+	return nil
+}
+
+// moveToWaitingChildren moves an active parent into the waiting-children state.
+// Returns true if it moved (pending children remain), false if there were no
+// pending dependencies (the caller may proceed). KEYS/ARGV from
+// moveToWaitingChildren-7.lua. childKey is "" to wait for all children.
+func (s *scripts) moveToWaitingChildren(ctx context.Context, jobID, token, childKey string) (bool, error) {
+	jobKey := s.keys.JobKey(jobID)
+	keys := []string{
+		s.keys.Active(), s.keys.WaitingChildren(), jobKey,
+		jobKey + ":dependencies", jobKey + ":unsuccessful", s.keys.Stalled(), s.keys.Events(),
+	}
+	args := []any{token, childKey, nowMillis(), jobID, s.keys.KeyPrefix()}
+	res, err := s.run(ctx, "moveToWaitingChildren", keys, args...)
+	if err != nil {
+		return false, err
+	}
+	code := toInt64(res)
+	switch {
+	case code == 0:
+		return true, nil // moved: pending children
+	case code == 1:
+		return false, nil // no pending dependencies
+	case code < 0:
+		return false, finishedError(ScriptErrorCode(code), errorContext{jobID: jobID, command: "moveToWaitingChildren", state: "active"})
+	default:
+		return false, nil
+	}
+}
+
+// getDependencyCounts returns child-state counts for the given types (any of
+// "processed", "unprocessed", "ignored", "failed"). From getDependencyCounts-4.lua.
+func (s *scripts) getDependencyCounts(ctx context.Context, jobID string, types []string) ([]int64, error) {
+	jobKey := s.keys.JobKey(jobID)
+	keys := []string{
+		jobKey + ":processed", jobKey + ":dependencies", jobKey + ":ignored", jobKey + ":failed",
+	}
+	args := make([]any, len(types))
+	for i, t := range types {
+		args[i] = t
+	}
+	res, err := s.run(ctx, "getDependencyCounts", keys, args...)
+	if err != nil {
+		return nil, err
+	}
+	arr, _ := res.([]any)
+	out := make([]int64, len(arr))
+	for i, v := range arr {
+		out[i] = toInt64(v)
+	}
+	return out, nil
+}
+
+// removeChildDependency breaks the parent-child link by removing the child's
+// reference from its parent. From removeChildDependency-1.lua.
+func (s *scripts) removeChildDependency(ctx context.Context, jobID, parentKey string) error {
+	keys := []string{s.keys.KeyPrefix()}
+	args := []any{s.keys.JobKey(jobID), parentKey}
+	res, err := s.run(ctx, "removeChildDependency", keys, args...)
+	if err != nil {
+		return err
+	}
+	if code := toInt64(res); code < 0 {
+		return finishedError(ScriptErrorCode(code), errorContext{jobID: jobID, command: "removeChildDependency"})
 	}
 	return nil
 }

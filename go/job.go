@@ -223,6 +223,53 @@ func (j *Job) moveToFailed(ctx context.Context, jobErr error, fo finishOpts, fet
 	return nil
 }
 
+// MoveToWaitingChildrenOpts configures moveToWaitingChildren. Child, when set,
+// waits for that single child; otherwise the job waits for all pending children.
+type MoveToWaitingChildrenOpts struct {
+	Child *ParentOptions
+}
+
+// MoveToWaitingChildren moves the job to the waiting-children state. It returns
+// true when the job was moved because children are still pending (the processor
+// should stop and return ErrWaitingChildren), false when there were no pending
+// dependencies and the processor may continue.
+func (j *Job) MoveToWaitingChildren(ctx context.Context, opts MoveToWaitingChildrenOpts) (bool, error) {
+	childKey := ""
+	if opts.Child != nil {
+		childKey = opts.Child.Queue + ":" + opts.Child.ID
+	}
+	return j.queue.scripts.moveToWaitingChildren(ctx, j.ID, j.token, childKey)
+}
+
+// GetChildrenValues returns the return values of this job's completed children,
+// keyed by child job key. Mirrors python Job.getChildrenValues.
+func (j *Job) GetChildrenValues(ctx context.Context) (map[string]any, error) {
+	key := j.queue.keys.JobKey(j.ID) + ":processed"
+	raw, err := j.queue.conn.client.HGetAll(ctx, key).Result()
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]any, len(raw))
+	for k, v := range raw {
+		var val any
+		if json.Unmarshal([]byte(v), &val) == nil {
+			out[k] = val
+		} else {
+			out[k] = v
+		}
+	}
+	return out, nil
+}
+
+// GetDependenciesCount returns the number of unprocessed (pending) child dependencies.
+func (j *Job) GetDependenciesCount(ctx context.Context) (int64, error) {
+	counts, err := j.queue.scripts.getDependencyCounts(ctx, j.ID, []string{"unprocessed"})
+	if err != nil || len(counts) == 0 {
+		return 0, err
+	}
+	return counts[0], nil
+}
+
 // decodeOpts rewrites short stored option keys back to their long form,
 // mirroring python job.py optsFromJSON.
 func decodeOpts(opts map[string]any) map[string]any {
