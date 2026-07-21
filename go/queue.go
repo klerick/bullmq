@@ -210,10 +210,18 @@ func (q *Queue) GetMetrics(ctx context.Context, metricType string, start, end in
 }
 
 // Pause stops the queue from handing out new jobs (wait -> paused).
-func (q *Queue) Pause(ctx context.Context) error { return q.scripts.pause(ctx, true) }
+func (q *Queue) Pause(ctx context.Context) (err error) {
+	ctx, span := q.tel.start(ctx, SpanKindInternal, "pause")
+	defer func() { span.finish(err) }()
+	return q.scripts.pause(ctx, true)
+}
 
 // Resume undoes Pause (paused -> wait).
-func (q *Queue) Resume(ctx context.Context) error { return q.scripts.pause(ctx, false) }
+func (q *Queue) Resume(ctx context.Context) (err error) {
+	ctx, span := q.tel.start(ctx, SpanKindInternal, "resume")
+	defer func() { span.finish(err) }()
+	return q.scripts.pause(ctx, false)
+}
 
 // IsPaused reports whether the queue is paused.
 func (q *Queue) IsPaused(ctx context.Context) (bool, error) {
@@ -222,18 +230,24 @@ func (q *Queue) IsPaused(ctx context.Context) (bool, error) {
 
 // Drain removes waiting and prioritized jobs (and delayed if includeDelayed).
 // Active, completed and failed jobs are left untouched.
-func (q *Queue) Drain(ctx context.Context, includeDelayed bool) error {
+func (q *Queue) Drain(ctx context.Context, includeDelayed bool) (err error) {
+	ctx, span := q.tel.start(ctx, SpanKindInternal, "drain")
+	defer func() { span.finish(err) }()
 	return q.scripts.drain(ctx, includeDelayed)
 }
 
 // Clean removes jobs older than grace (ms) from a state set, up to limit
 // (0 = unlimited). Returns the removed job ids.
-func (q *Queue) Clean(ctx context.Context, grace, limit int64, state string) ([]string, error) {
+func (q *Queue) Clean(ctx context.Context, grace, limit int64, state string) (_ []string, err error) {
+	ctx, span := q.tel.start(ctx, SpanKindInternal, "clean")
+	defer func() { span.finish(err) }()
 	return q.scripts.cleanJobsInSet(ctx, state, grace, limit)
 }
 
 // RetryJobs moves failed (or completed) jobs back to wait, in batches of count.
-func (q *Queue) RetryJobs(ctx context.Context, state string, count int) error {
+func (q *Queue) RetryJobs(ctx context.Context, state string, count int) (err error) {
+	ctx, span := q.tel.start(ctx, SpanKindInternal, "retryJobs")
+	defer func() { span.finish(err) }()
 	if state == "" {
 		state = "failed"
 	}
@@ -249,7 +263,9 @@ func (q *Queue) RetryJobs(ctx context.Context, state string, count int) error {
 }
 
 // PromoteJobs moves delayed jobs to wait, in batches of count.
-func (q *Queue) PromoteJobs(ctx context.Context, count int) error {
+func (q *Queue) PromoteJobs(ctx context.Context, count int) (err error) {
+	ctx, span := q.tel.start(ctx, SpanKindInternal, "promoteJobs")
+	defer func() { span.finish(err) }()
 	for {
 		// A far-future timestamp promotes all delayed jobs regardless of their time.
 		more, err := q.scripts.moveJobsToWait(ctx, "delayed", count, 1<<62)
@@ -264,7 +280,9 @@ func (q *Queue) PromoteJobs(ctx context.Context, count int) error {
 
 // Obliterate pauses the queue and removes it entirely. With force it also removes
 // active jobs.
-func (q *Queue) Obliterate(ctx context.Context, force bool) error {
+func (q *Queue) Obliterate(ctx context.Context, force bool) (err error) {
+	ctx, span := q.tel.start(ctx, SpanKindInternal, "obliterate")
+	defer func() { span.finish(err) }()
 	if err := q.Pause(ctx); err != nil {
 		return err
 	}
@@ -286,13 +304,17 @@ func (q *Queue) Obliterate(ctx context.Context, force bool) error {
 
 // Remove deletes a job (and its children unless removeChildren is false). Returns
 // true if the job was removed.
-func (q *Queue) Remove(ctx context.Context, id string, removeChildren bool) (bool, error) {
+func (q *Queue) Remove(ctx context.Context, id string, removeChildren bool) (_ bool, err error) {
+	ctx, span := q.tel.start(ctx, SpanKindInternal, "remove")
+	defer func() { span.finish(err) }()
 	r, err := q.scripts.removeJob(ctx, id, removeChildren)
 	return r == 1, err
 }
 
 // TrimEvents caps the events stream to maxLen entries.
-func (q *Queue) TrimEvents(ctx context.Context, maxLen int64) (int64, error) {
+func (q *Queue) TrimEvents(ctx context.Context, maxLen int64) (_ int64, err error) {
+	ctx, span := q.tel.start(ctx, SpanKindInternal, "trimEvents")
+	defer func() { span.finish(err) }()
 	return q.conn.client.XTrimMaxLen(ctx, q.keys.Events(), maxLen).Result()
 }
 
@@ -313,13 +335,15 @@ type BulkJob struct {
 }
 
 // AddBulk enqueues many jobs in a single pipeline and returns them with ids.
-func (q *Queue) AddBulk(ctx context.Context, specs []BulkJob) ([]*Job, error) {
+func (q *Queue) AddBulk(ctx context.Context, specs []BulkJob) (_ []*Job, err error) {
+	ctx, span := q.tel.start(ctx, SpanKindProducer, "addBulk")
+	defer func() { span.finish(err) }()
 	if err := q.conn.LoadScripts(ctx); err != nil {
 		return nil, err
 	}
 	jobs := make([]*Job, len(specs))
 	cmds := make([]*redis.Cmd, len(specs))
-	_, err := q.conn.client.Pipelined(ctx, func(pipe redis.Pipeliner) error {
+	_, err = q.conn.client.Pipelined(ctx, func(pipe redis.Pipeliner) error {
 		for i, spec := range specs {
 			job := newJob(q, spec.Name, spec.Data, spec.Opts)
 			jobs[i] = job
@@ -397,12 +421,16 @@ func (q *Queue) RemoveGlobalRateLimit(ctx context.Context) error {
 }
 
 // RateLimit rate-limits the whole queue for expireMs milliseconds.
-func (q *Queue) RateLimit(ctx context.Context, expireMs int64) error {
+func (q *Queue) RateLimit(ctx context.Context, expireMs int64) (err error) {
+	ctx, span := q.tel.start(ctx, SpanKindInternal, "rateLimit")
+	defer func() { span.finish(err) }()
 	return q.conn.client.Set(ctx, q.keys.Limiter(), maxSafeInteger, time.Duration(expireMs)*time.Millisecond).Err()
 }
 
 // RemoveRateLimitKey clears an active rate limit, returning the keys removed.
-func (q *Queue) RemoveRateLimitKey(ctx context.Context) (int64, error) {
+func (q *Queue) RemoveRateLimitKey(ctx context.Context) (_ int64, err error) {
+	ctx, span := q.tel.start(ctx, SpanKindInternal, "removeRateLimitKey")
+	defer func() { span.finish(err) }()
 	return q.conn.client.Del(ctx, q.keys.Limiter()).Result()
 }
 
@@ -416,9 +444,11 @@ func (q *Queue) GetRateLimitTtl(ctx context.Context, maxJobs int) (int64, error)
 // GetWorkers returns the workers connected to this queue, parsed from CLIENT LIST.
 // Workers register a client name via CLIENT SETNAME; providers that block those
 // commands yield an empty list.
-func (q *Queue) GetWorkers(ctx context.Context) ([]map[string]string, error) {
-	list, err := q.conn.client.Do(ctx, "CLIENT", "LIST").Text()
-	if err != nil {
+func (q *Queue) GetWorkers(ctx context.Context) (_ []map[string]string, err error) {
+	ctx, span := q.tel.start(ctx, SpanKindInternal, "getWorkers")
+	defer func() { span.finish(err) }()
+	list, listErr := q.conn.client.Do(ctx, "CLIENT", "LIST").Text()
+	if listErr != nil {
 		return nil, nil // best-effort: CLIENT LIST may be unavailable
 	}
 	return parseClientList(list, q.keys.ClientName("")), nil
@@ -441,7 +471,9 @@ func (q *Queue) GetDeduplicationJobID(ctx context.Context, id string) (string, e
 }
 
 // RemoveDeduplicationKey clears a deduplication id, returning the keys removed.
-func (q *Queue) RemoveDeduplicationKey(ctx context.Context, id string) (int64, error) {
+func (q *Queue) RemoveDeduplicationKey(ctx context.Context, id string) (_ int64, err error) {
+	ctx, span := q.tel.start(ctx, SpanKindInternal, "removeDeduplicationKey")
+	defer func() { span.finish(err) }()
 	return q.conn.client.Del(ctx, q.keys.Get("de")+":"+id).Result()
 }
 

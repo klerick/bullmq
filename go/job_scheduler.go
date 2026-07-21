@@ -66,7 +66,9 @@ type JobSchedulerJSON struct {
 
 // UpsertJobScheduler creates or replaces a job scheduler and enqueues its first
 // job (immediate for a plain interval, otherwise delayed), returning that job.
-func (q *Queue) UpsertJobScheduler(ctx context.Context, id string, repeat RepeatOptions, name string, data any, opts *JobOptions) (*Job, error) {
+func (q *Queue) UpsertJobScheduler(ctx context.Context, id string, repeat RepeatOptions, name string, data any, opts *JobOptions) (_ *Job, err error) {
+	ctx, span := q.tel.start(ctx, SpanKindProducer, "upsertJobScheduler")
+	defer func() { span.finish(err) }()
 	return q.upsertJobScheduler(ctx, id, repeat, name, data, opts, true, "")
 }
 

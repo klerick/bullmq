@@ -61,7 +61,8 @@ cross-runtime tests against Node BullMQ (see `interop_test.go`, `cron_interop_te
 | WorkerName / SkipStalledCheck / SkipLockRenewal   | ✅       |
 | Job scheduler next-iteration production           | ✅       |
 | Events (via QueueEvents)                          | ✅       |
-| Custom backoff strategies / Telemetry             | ❌       |
+| Telemetry / OpenTelemetry (via bullmq/otel)       | ✅       |
+| Custom backoff strategies                         | ❌       |
 | Sandboxed processors                              | ❌ (N/A) |
 
 ## Job features
@@ -80,7 +81,7 @@ cross-runtime tests against Node BullMQ (see `interop_test.go`, `cron_interop_te
 delay ✅ · priority ✅ · attempts ✅ · backoff (fixed/exponential/jitter) ✅ · lifo ✅ ·
 jobId ✅ · removeOnComplete/removeOnFail ✅ · deduplication ✅ · repeat/cron ✅ · parent ✅ ·
 failParentOnFailure / removeDependencyOnFailure / ignoreDependencyOnFailure /
-continueParentOnFailure ✅ (stored) · keepLogs 🚧 · sizeLimit ❌ · telemetry ❌
+continueParentOnFailure ✅ (stored) · keepLogs 🚧 · sizeLimit ❌ · telemetry ✅ (trace propagation via tm)
 
 ## Connection & infrastructure
 
@@ -103,5 +104,4 @@ and QueueEvents.
 ## Intentionally out of scope
 
 - **Sandboxed processors** — not applicable in Go; run native goroutines.
-- **Telemetry / OpenTelemetry** — optional, behind a future build tag.
 - **Job.WaitUntilFinished** — a testing convenience prone to misuse in production.
