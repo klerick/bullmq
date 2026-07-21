@@ -410,6 +410,20 @@ func (q *Queue) RemoveDeduplicationKey(ctx context.Context, id string) (int64, e
 	return q.conn.client.Del(ctx, q.keys.Get("de")+":"+id).Result()
 }
 
+// GetDebounceJobID is a deprecated alias for GetDeduplicationJobID.
+//
+// Deprecated: use GetDeduplicationJobID.
+func (q *Queue) GetDebounceJobID(ctx context.Context, id string) (string, error) {
+	return q.GetDeduplicationJobID(ctx, id)
+}
+
+// RemoveDebounceKey is a deprecated alias for RemoveDeduplicationKey.
+//
+// Deprecated: use RemoveDeduplicationKey.
+func (q *Queue) RemoveDebounceKey(ctx context.Context, id string) (int64, error) {
+	return q.RemoveDeduplicationKey(ctx, id)
+}
+
 // parseClientList extracts CLIENT LIST rows whose name matches this queue's
 // worker-client prefix.
 func parseClientList(list, prefix string) []map[string]string {
