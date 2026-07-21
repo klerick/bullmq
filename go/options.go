@@ -2,13 +2,17 @@ package bullmq
 
 import "github.com/redis/go-redis/v9"
 
-// config holds the connection-level settings shared by Queue, Worker and
-// FlowProducer. It is populated through functional Options.
+// config holds the settings shared by Queue, Worker and FlowProducer. It is
+// populated through functional Options. Worker-only fields are ignored by Queue.
 type config struct {
 	prefix         string
 	client         redis.UniversalClient
 	blockingClient redis.UniversalClient
 	redisOptions   *redis.Options
+
+	// worker-only
+	concurrency  int
+	lockDuration int64 // milliseconds
 }
 
 // Option customises a Queue/Worker/FlowProducer at construction time.
@@ -37,6 +41,16 @@ func WithRedisOptions(o *redis.Options) Option {
 // WithPrefix overrides the key prefix (default "bull").
 func WithPrefix(prefix string) Option {
 	return func(cfg *config) { cfg.prefix = prefix }
+}
+
+// WithConcurrency sets how many jobs a Worker processes in parallel (default 1).
+func WithConcurrency(n int) Option {
+	return func(cfg *config) { cfg.concurrency = n }
+}
+
+// WithLockDuration sets the job lock duration in milliseconds (default 30000).
+func WithLockDuration(ms int64) Option {
+	return func(cfg *config) { cfg.lockDuration = ms }
 }
 
 // newConfig applies options over the defaults.

@@ -143,3 +143,213 @@ func parseAddResult(res any, parentKey string) (string, error) {
 		return "", fmt.Errorf("bullmq: unexpected addJob result %v (%T)", res, res)
 	}
 }
+
+// moveToActiveOpts is the per-fetch input packed for moveToActive.
+type moveToActiveOpts struct {
+	token        string
+	lockDuration int64
+	limiter      any
+}
+
+// moveToActive fetches the next job into the active state. It returns the job's
+// flat hash (or nil when none is available) plus the id and the rate-limit /
+// next-delayed timestamps. KEYS/ARGV from moveToActive-11.lua.
+func (s *scripts) moveToActive(ctx context.Context, o moveToActiveOpts) (jobData map[string]string, jobID string, limitUntil, delayUntil int64, err error) {
+	keys := []string{
+		s.keys.Wait(), s.keys.Active(), s.keys.Prioritized(), s.keys.Events(),
+		s.keys.Stalled(), s.keys.Limiter(), s.keys.Delayed(), s.keys.Paused(),
+		s.keys.Meta(), s.keys.PC(), s.keys.Marker(),
+	}
+	packedOpts, err := packMsgpack(map[string]any{
+		"token": o.token, "lockDuration": o.lockDuration, "limiter": o.limiter,
+	})
+	if err != nil {
+		return nil, "", 0, 0, err
+	}
+	args := []any{s.keys.KeyPrefix(), nowMillis(), packedOpts}
+	res, err := s.run(ctx, "moveToActive", keys, args...)
+	if err != nil {
+		return nil, "", 0, 0, err
+	}
+	jobData, jobID, limitUntil, delayUntil = parseNextJobData(res)
+	return jobData, jobID, limitUntil, delayUntil, nil
+}
+
+// parseNextJobData decodes the {jobData, jobId, limitUntil, delayUntil} reply of
+// moveToActive/moveToFinished. Mirrors python scripts.py::raw2NextJobData. jobData
+// is nil when no job was returned (the script sends 0 in that slot).
+func parseNextJobData(res any) (map[string]string, string, int64, int64) {
+	arr, ok := res.([]any)
+	if !ok || len(arr) == 0 {
+		return nil, "", 0, 0
+	}
+	var jobData map[string]string
+	if flat, ok := arr[0].([]any); ok && len(flat) > 0 {
+		jobData = flatArrayToMap(flat)
+	}
+	var jobID string
+	if jobData != nil && len(arr) >= 2 {
+		jobID = toStr(arr[1])
+	}
+	var limitUntil, delayUntil int64
+	if len(arr) >= 4 {
+		limitUntil = toInt64(arr[2])
+		delayUntil = toInt64(arr[3])
+	}
+	return jobData, jobID, limitUntil, delayUntil
+}
+
+// finishOpts carries the worker-level context needed to finish a job.
+type finishOpts struct {
+	token            string
+	lockDuration     int64
+	limiter          any
+	removeOnComplete any
+	removeOnFail     any
+}
+
+// moveToCompleted moves the job to the completed set with a JSON-encoded return value.
+func (s *scripts) moveToCompleted(ctx context.Context, job *Job, returnValue any, fo finishOpts, fetchNext bool) (any, error) {
+	valBytes, err := marshalJSON(returnValue)
+	if err != nil {
+		return nil, err
+	}
+	keys, args := s.moveToFinishedArgs(job, string(valBytes), "returnvalue", "completed", fo, fo.removeOnComplete, fetchNext, nil)
+	return s.runMoveToFinished(ctx, job.ID, keys, args)
+}
+
+// moveToFailedFinal moves the job to the failed set (no more retries). Unlike the
+// return value, failedReason is stored raw (not JSON-encoded), matching Node/rust.
+func (s *scripts) moveToFailedFinal(ctx context.Context, job *Job, failedReason string, fo finishOpts, fetchNext bool, fieldsToUpdate map[string]any) (any, error) {
+	keys, args := s.moveToFinishedArgs(job, failedReason, "failedReason", "failed", fo, fo.removeOnFail, fetchNext, fieldsToUpdate)
+	return s.runMoveToFinished(ctx, job.ID, keys, args)
+}
+
+// moveToFinishedArgs builds KEYS/ARGV for moveToFinished-14. Ported from python
+// scripts.py::moveToFinishedArgs. value is already transformed (JSON for completed,
+// raw for failed).
+func (s *scripts) moveToFinishedArgs(job *Job, value, propName, target string, fo finishOpts, shouldRemove any, fetchNext bool, fieldsToUpdate map[string]any) ([]string, []any) {
+	keys := []string{
+		s.keys.Wait(), s.keys.Active(), s.keys.Prioritized(), s.keys.Events(),
+		s.keys.Stalled(), s.keys.Limiter(), s.keys.Delayed(), s.keys.Paused(),
+		s.keys.Meta(), s.keys.PC(), s.keys.Get(target),
+		s.keys.JobKey(job.ID), s.keys.Get("metrics:" + target), s.keys.Marker(),
+	}
+	packedOpts, _ := packMsgpack(map[string]any{
+		"token":          fo.token,
+		"keepJobs":       getKeepJobs(shouldRemove),
+		"limiter":        fo.limiter,
+		"lockDuration":   fo.lockDuration,
+		"attempts":       job.Attempts,
+		"attemptsMade":   job.AttemptsMade,
+		"maxMetricsSize": "",
+		"fpof":           job.optBool("failParentOnFailure"),
+		"cpof":           job.optBool("continueParentOnFailure"),
+		"idof":           job.optBool("ignoreDependencyOnFailure"),
+		"rdof":           job.optBool("removeDependencyOnFailure"),
+	})
+	fetchStr := ""
+	if fetchNext {
+		fetchStr = "1"
+	}
+	args := []any{job.ID, nowMillis(), propName, value, target, fetchStr, s.keys.KeyPrefix(), packedOpts}
+	if len(fieldsToUpdate) > 0 {
+		packedFields, _ := packMsgpack(objectToFlatArray(fieldsToUpdate))
+		args = append(args, packedFields)
+	}
+	return keys, args
+}
+
+func (s *scripts) runMoveToFinished(ctx context.Context, jobID string, keys []string, args []any) (any, error) {
+	res, err := s.run(ctx, "moveToFinished", keys, args...)
+	if err != nil {
+		return nil, err
+	}
+	if code, ok := res.(int64); ok && code < 0 {
+		return nil, finishedError(ScriptErrorCode(code), errorContext{jobID: jobID, command: "moveToFinished", state: "active"})
+	}
+	return res, nil
+}
+
+// moveToDelayed moves an active job to the delayed set for a backoff retry.
+// KEYS/ARGV from moveToDelayed-12.lua.
+func (s *scripts) moveToDelayed(ctx context.Context, jobID string, timestamp, delay int64, token string, fieldsToUpdate map[string]any) error {
+	keys := []string{
+		s.keys.Marker(), s.keys.Active(), s.keys.Prioritized(), s.keys.Delayed(),
+		s.keys.JobKey(jobID), s.keys.Events(), s.keys.Meta(), s.keys.Stalled(),
+		s.keys.Wait(), s.keys.Limiter(), s.keys.Paused(), s.keys.PC(),
+	}
+	args := []any{s.keys.KeyPrefix(), strconv.FormatInt(timestamp, 10), jobID, token, delay, "0"}
+	if len(fieldsToUpdate) > 0 {
+		packed, _ := packMsgpack(objectToFlatArray(fieldsToUpdate))
+		args = append(args, packed)
+	} else {
+		args = append(args, "")
+	}
+	args = append(args, "0") // fetchNext = false
+	res, err := s.run(ctx, "moveToDelayed", keys, args...)
+	if err != nil {
+		return err
+	}
+	if code, ok := res.(int64); ok && code < 0 {
+		return finishedError(ScriptErrorCode(code), errorContext{jobID: jobID, command: "moveToDelayed", state: "active"})
+	}
+	return nil
+}
+
+// retryJob moves an active job back to wait for an immediate retry.
+// KEYS/ARGV from retryJob-11.lua.
+func (s *scripts) retryJob(ctx context.Context, jobID string, lifo bool, token string, fieldsToUpdate map[string]any) error {
+	keys := []string{
+		s.keys.Active(), s.keys.Wait(), s.keys.Paused(), s.keys.JobKey(jobID),
+		s.keys.Meta(), s.keys.Events(), s.keys.Delayed(), s.keys.Prioritized(),
+		s.keys.PC(), s.keys.Marker(), s.keys.Stalled(),
+	}
+	pushCmd := "LPUSH"
+	if lifo {
+		pushCmd = "RPUSH"
+	}
+	args := []any{s.keys.KeyPrefix(), nowMillis(), pushCmd, jobID, token}
+	if len(fieldsToUpdate) > 0 {
+		packed, _ := packMsgpack(objectToFlatArray(fieldsToUpdate))
+		args = append(args, packed)
+	}
+	res, err := s.run(ctx, "retryJob", keys, args...)
+	if err != nil {
+		return err
+	}
+	if code, ok := res.(int64); ok && code < 0 {
+		return finishedError(ScriptErrorCode(code), errorContext{jobID: jobID, command: "retryJob", state: "active"})
+	}
+	return nil
+}
+
+// getKeepJobs normalises removeOnComplete/removeOnFail into the {count|age|...}
+// map the Lua expects. Mirrors python scripts.py::getKeepJobs.
+func getKeepJobs(shouldRemove any) map[string]any {
+	switch v := shouldRemove.(type) {
+	case map[string]any:
+		return v
+	case int:
+		return map[string]any{"count": v}
+	case int64:
+		return map[string]any{"count": v}
+	case bool:
+		if v {
+			return map[string]any{"count": 0}
+		}
+		return map[string]any{"count": -1}
+	default:
+		return map[string]any{"count": -1} // nil / unknown -> keep all
+	}
+}
+
+// objectToFlatArray flattens {k:v, ...} into [k, v, ...] for packing.
+// Mirrors python utils.object_to_flat_array.
+func objectToFlatArray(m map[string]any) []any {
+	out := make([]any, 0, len(m)*2)
+	for k, v := range m {
+		out = append(out, k, v)
+	}
+	return out
+}
