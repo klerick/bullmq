@@ -62,13 +62,20 @@ jobs:
           node-version: lts/*
           cache: 'yarn'
 
-      # The Go port embeds the include-resolved Lua from rawScripts. Regenerate it
-      # from src/commands and copy it into go/commands (gitignored, like rust).
-      - name: Generate rawScripts and copy into go/commands
+      # The Go port embeds the include-resolved Lua from rawScripts. Unlike rust/
+      # python (which package these at publish time), Go serves modules straight from
+      # the git tag, so go/commands/*.lua MUST be committed. Regenerate here and fail
+      # if the committed copy is stale — i.e. someone changed src/commands without
+      # running `yarn generate:raw:scripts && yarn copy:lua:go` and committing.
+      - name: Verify committed go/commands is up to date
         run: |
           yarn install --frozen-lockfile --non-interactive
           yarn generate:raw:scripts
           yarn copy:lua:go
+          if ! git diff --exit-code -- go/commands; then
+            echo "::error::go/commands is stale. Run 'yarn generate:raw:scripts && yarn copy:lua:go' and commit."
+            exit 1
+          fi
 
       - name: Install Go toolchain
         uses: actions/setup-go@v5
