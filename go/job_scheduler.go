@@ -4,7 +4,38 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
+
+	"github.com/robfig/cron/v3"
 )
+
+// cronNextMillis computes the next run time (ms epoch) strictly after afterMillis
+// for a cron pattern, matching the client-side scheduling Node does with
+// cron-parser. Supports 5-field (minute-precision) and 6-field (leading seconds)
+// patterns. Interop with cron-parser is verified by cross-runtime tests.
+func cronNextMillis(pattern, tz string, afterMillis int64) (int64, error) {
+	// cron-parser defaults to the local timezone when none is given, so match that
+	// (BullMQ cron schedules without a tz are inherently server-local).
+	loc := time.Local
+	if tz != "" {
+		l, err := time.LoadLocation(tz)
+		if err != nil {
+			return 0, fmt.Errorf("%w: invalid timezone %q: %v", ErrInvalidConfig, tz, err)
+		}
+		loc = l
+	}
+	var parser cron.Parser
+	if len(strings.Fields(pattern)) >= 6 {
+		parser = cron.NewParser(cron.Second | cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow | cron.Descriptor)
+	} else {
+		parser = cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow | cron.Descriptor)
+	}
+	sched, err := parser.Parse(pattern)
+	if err != nil {
+		return 0, fmt.Errorf("%w: invalid cron pattern %q: %v", ErrInvalidConfig, pattern, err)
+	}
+	return sched.Next(time.UnixMilli(afterMillis).In(loc)).UnixMilli(), nil
+}
 
 // RepeatOptions configures a job scheduler. Exactly one of Every (interval in ms)
 // or Pattern (cron) must be set. Cron patterns are not yet supported by this port
@@ -45,8 +76,6 @@ func (q *Queue) upsertJobScheduler(ctx context.Context, id string, repeat Repeat
 		return nil, fmt.Errorf("%w: both .Pattern and .Every are set for a scheduler", ErrInvalidConfig)
 	case repeat.Pattern == "" && repeat.Every == 0:
 		return nil, fmt.Errorf("%w: either .Pattern or .Every must be set for a scheduler", ErrInvalidConfig)
-	case repeat.Pattern != "":
-		return nil, fmt.Errorf("%w: cron .Pattern schedulers are not yet supported; use .Every", ErrInvalidConfig)
 	}
 
 	now := nowMillis()
@@ -61,11 +90,28 @@ func (q *Queue) upsertJobScheduler(ctx context.Context, id string, repeat Repeat
 		return nil, nil
 	}
 
-	// nextMillis for an interval: align to the interval boundary. Matches
-	// getNextMillis in repeat.ts: floor(now/every)*every + (immediately ? 0 : every).
-	nextMillis := (now / repeat.Every) * repeat.Every
-	if !repeat.Immediately {
-		nextMillis += repeat.Every
+	// nextMillis. For a cron pattern it is computed client-side (the Lua trusts it);
+	// for an interval the Lua recomputes it, but we still pass a value.
+	var nextMillis int64
+	if repeat.Pattern != "" {
+		after := now
+		if repeat.StartDate > 0 && repeat.StartDate > now {
+			after = repeat.StartDate
+		}
+		nm, err := cronNextMillis(repeat.Pattern, repeat.Tz, after)
+		if err != nil {
+			return nil, err
+		}
+		nextMillis = nm
+		if nextMillis < now {
+			nextMillis = now
+		}
+	} else {
+		// getNextMillis in repeat.ts: floor(now/every)*every + (immediately ? 0 : every).
+		nextMillis = (now / repeat.Every) * repeat.Every
+		if !repeat.Immediately {
+			nextMillis += repeat.Every
+		}
 	}
 
 	var offsetVal any
@@ -124,7 +170,18 @@ func (q *Queue) upsertJobScheduler(ctx context.Context, id string, repeat Repeat
 	}
 
 	if override {
-		schedulerOpts := map[string]any{"name": name, "offset": offsetVal, "every": repeat.Every}
+		// Do NOT set "every" for a cron pattern: the Lua treats a present every
+		// (even 0, which is truthy in Lua) as an interval and recomputes nextMillis.
+		schedulerOpts := map[string]any{"name": name, "offset": offsetVal}
+		if repeat.Every > 0 {
+			schedulerOpts["every"] = repeat.Every
+		}
+		if repeat.Pattern != "" {
+			schedulerOpts["pattern"] = repeat.Pattern
+		}
+		if repeat.Tz != "" {
+			schedulerOpts["tz"] = repeat.Tz
+		}
 		if repeat.Limit > 0 {
 			schedulerOpts["limit"] = repeat.Limit
 		}
