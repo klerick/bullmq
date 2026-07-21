@@ -442,6 +442,47 @@ func (s *scripts) removeChildDependency(ctx context.Context, jobID, parentKey st
 	return nil
 }
 
+// extendLock renews a job's lock (SET lock PX + SREM from stalled). Returns true
+// if the lock was still held by token and got renewed. From extendLock-2.lua.
+func (s *scripts) extendLock(ctx context.Context, jobID, token string, duration int64) (bool, error) {
+	keys := []string{s.keys.JobKey(jobID) + ":lock", s.keys.Stalled()}
+	args := []any{token, duration, jobID}
+	res, err := s.run(ctx, "extendLock", keys, args...)
+	if err != nil {
+		return false, err
+	}
+	return toInt64(res) == 1, nil
+}
+
+// releaseLock deletes a job's lock if still held by token. From releaseLock-1.lua.
+func (s *scripts) releaseLock(ctx context.Context, jobID, token string) error {
+	keys := []string{s.keys.JobKey(jobID) + ":lock"}
+	args := []any{token, "0"}
+	_, err := s.run(ctx, "releaseLock", keys, args...)
+	return err
+}
+
+// moveStalledJobsToWait detects jobs whose worker died (lock not renewed across
+// two checks) and moves them back to wait (or to failed past maxStalledCount).
+// It returns the ids that were moved this cycle. From moveStalledJobsToWait-9.lua.
+func (s *scripts) moveStalledJobsToWait(ctx context.Context, maxStalledCount int, stalledInterval int64) ([]string, error) {
+	keys := []string{
+		s.keys.Stalled(), s.keys.Wait(), s.keys.Active(), s.keys.StalledCheck(),
+		s.keys.Meta(), s.keys.Paused(), s.keys.Marker(), s.keys.Events(), s.keys.Repeat(),
+	}
+	args := []any{maxStalledCount, s.keys.KeyPrefix(), nowMillis(), stalledInterval}
+	res, err := s.run(ctx, "moveStalledJobsToWait", keys, args...)
+	if err != nil {
+		return nil, err
+	}
+	arr, _ := res.([]any)
+	out := make([]string, 0, len(arr))
+	for _, v := range arr {
+		out = append(out, toStr(v))
+	}
+	return out, nil
+}
+
 // getKeepJobs normalises removeOnComplete/removeOnFail into the {count|age|...}
 // map the Lua expects. Mirrors python scripts.py::getKeepJobs.
 func getKeepJobs(shouldRemove any) map[string]any {

@@ -11,9 +11,11 @@ import (
 )
 
 const (
-	defaultLockDuration int64 = 30000 // ms
-	defaultDrainDelay         = 5 * time.Second
-	maxBlockTimeout           = 10 * time.Second
+	defaultLockDuration    int64 = 30000 // ms
+	defaultStalledInterval int64 = 30000 // ms
+	defaultMaxStalledCount       = 1
+	defaultDrainDelay            = 5 * time.Second
+	maxBlockTimeout              = 10 * time.Second
 )
 
 // Processor handles a single job. Returning a value completes the job; returning
@@ -25,16 +27,21 @@ type Processor func(ctx context.Context, job *Job) (any, error)
 // with NewWorker and the same functional options as Queue, plus WithConcurrency /
 // WithLockDuration.
 type Worker struct {
-	queue        *Queue
-	processor    Processor
-	concurrency  int
-	lockDuration int64
-	drainDelay   time.Duration
-	id           string
+	queue           *Queue
+	processor       Processor
+	concurrency     int
+	lockDuration    int64
+	stalledInterval int64
+	maxStalledCount int
+	drainDelay      time.Duration
+	id              string
 
 	drained    bool
 	blockUntil int64
 	limitUntil int64
+
+	mu     sync.Mutex
+	active map[string]string // jobID -> lock token, for lock renewal
 }
 
 // NewWorker builds a worker for the named queue. It does not start processing;
@@ -53,14 +60,25 @@ func NewWorker(name string, processor Processor, opts ...Option) (*Worker, error
 	if lockDuration == 0 {
 		lockDuration = defaultLockDuration
 	}
+	stalledInterval := cfg.stalledInterval
+	if stalledInterval == 0 {
+		stalledInterval = defaultStalledInterval
+	}
+	maxStalledCount := cfg.maxStalledCount
+	if maxStalledCount == 0 {
+		maxStalledCount = defaultMaxStalledCount
+	}
 	return &Worker{
-		queue:        q,
-		processor:    processor,
-		concurrency:  concurrency,
-		lockDuration: lockDuration,
-		drainDelay:   defaultDrainDelay,
-		id:           genID(),
-		drained:      true,
+		queue:           q,
+		processor:       processor,
+		concurrency:     concurrency,
+		lockDuration:    lockDuration,
+		stalledInterval: stalledInterval,
+		maxStalledCount: maxStalledCount,
+		drainDelay:      defaultDrainDelay,
+		id:              genID(),
+		drained:         true,
+		active:          make(map[string]string),
 	}, nil
 }
 
@@ -69,6 +87,12 @@ func NewWorker(name string, processor Processor, opts ...Option) (*Worker, error
 func (w *Worker) Run(ctx context.Context) error {
 	sem := make(chan struct{}, w.concurrency)
 	var wg sync.WaitGroup
+
+	// Background maintenance: renew locks of active jobs, and recover stalled ones.
+	wg.Add(2)
+	go func() { defer wg.Done(); w.lockRenewalLoop(ctx) }()
+	go func() { defer wg.Done(); w.stalledCheckLoop(ctx) }()
+
 	seq := 0
 
 	for ctx.Err() == nil {
@@ -169,6 +193,9 @@ func (w *Worker) blockTimeout() time.Duration {
 }
 
 func (w *Worker) processJob(ctx context.Context, job *Job) {
+	w.registerActive(job.ID, job.token)
+	defer w.unregisterActive(job.ID)
+
 	fo := finishOpts{
 		token:            job.token,
 		lockDuration:     w.lockDuration,
@@ -184,6 +211,67 @@ func (w *Worker) processJob(ctx context.Context, job *Job) {
 		return
 	}
 	_ = job.moveToCompleted(ctx, result, fo, false)
+}
+
+func (w *Worker) registerActive(jobID, token string) {
+	w.mu.Lock()
+	w.active[jobID] = token
+	w.mu.Unlock()
+}
+
+func (w *Worker) unregisterActive(jobID string) {
+	w.mu.Lock()
+	delete(w.active, jobID)
+	w.mu.Unlock()
+}
+
+// lockRenewalLoop renews the locks of all in-flight jobs every lockDuration/2, so
+// long-running jobs are not mistaken for stalled. Mirrors python Worker.extendLocks.
+func (w *Worker) lockRenewalLoop(ctx context.Context) {
+	interval := time.Duration(w.lockDuration/2) * time.Millisecond
+	if interval <= 0 {
+		interval = time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			w.extendLocks(ctx)
+		}
+	}
+}
+
+func (w *Worker) extendLocks(ctx context.Context) {
+	w.mu.Lock()
+	snapshot := make(map[string]string, len(w.active))
+	for id, token := range w.active {
+		snapshot[id] = token
+	}
+	w.mu.Unlock()
+	for id, token := range snapshot {
+		_, _ = w.queue.scripts.extendLock(ctx, id, token, w.lockDuration)
+	}
+}
+
+// stalledCheckLoop periodically moves jobs whose worker died back to wait.
+func (w *Worker) stalledCheckLoop(ctx context.Context) {
+	interval := time.Duration(w.stalledInterval) * time.Millisecond
+	if interval <= 0 {
+		interval = defaultDrainDelay
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			_, _ = w.queue.scripts.moveStalledJobsToWait(ctx, w.maxStalledCount, w.stalledInterval)
+		}
+	}
 }
 
 // Close stops using resources, closing only clients the worker owns.

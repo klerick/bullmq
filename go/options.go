@@ -11,8 +11,10 @@ type config struct {
 	redisOptions   *redis.Options
 
 	// worker-only
-	concurrency  int
-	lockDuration int64 // milliseconds
+	concurrency     int
+	lockDuration    int64 // milliseconds
+	stalledInterval int64 // milliseconds
+	maxStalledCount int
 }
 
 // Option customises a Queue/Worker/FlowProducer at construction time.
@@ -51,6 +53,18 @@ func WithConcurrency(n int) Option {
 // WithLockDuration sets the job lock duration in milliseconds (default 30000).
 func WithLockDuration(ms int64) Option {
 	return func(cfg *config) { cfg.lockDuration = ms }
+}
+
+// WithStalledInterval sets how often (ms) the worker checks for stalled jobs
+// (default 30000).
+func WithStalledInterval(ms int64) Option {
+	return func(cfg *config) { cfg.stalledInterval = ms }
+}
+
+// WithMaxStalledCount sets how many times a job may be recovered from the stalled
+// state before being failed (default 1).
+func WithMaxStalledCount(n int) Option {
+	return func(cfg *config) { cfg.maxStalledCount = n }
 }
 
 // newConfig applies options over the defaults.
