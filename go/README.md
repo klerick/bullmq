@@ -10,15 +10,12 @@ Interoperability is verified by cross-runtime tests against Node BullMQ.
 ## Install
 
 ```sh
-go get github.com/taskforcesh/bullmq/go
+go get github.com/klerick/bullmq/go@latest
 ```
 
-> While the Go port lives in a fork (before the upstream PR is merged), consume it
-> via a filesystem `replace` in your `go.mod`:
->
-> ```
-> replace github.com/taskforcesh/bullmq/go => /path/to/bullmq/go
-> ```
+The module currently lives in the `go/` subdirectory of a fork, released under
+`go/vX.Y.Z` tags. When the port is merged upstream the import path becomes
+`github.com/taskforcesh/bullmq/go` (a one-time change).
 
 Requires Go 1.24+ and Redis 6.2+.
 
@@ -31,7 +28,7 @@ import (
 	"context"
 	"fmt"
 
-	bullmq "github.com/taskforcesh/bullmq/go"
+	bullmq "github.com/klerick/bullmq/go"
 	"github.com/redis/go-redis/v9"
 )
 

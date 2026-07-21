@@ -1,4 +1,4 @@
-module github.com/taskforcesh/bullmq/go
+module github.com/klerick/bullmq/go
 
 go 1.25.0
 

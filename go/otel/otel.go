@@ -10,7 +10,7 @@ import (
 	"context"
 	"encoding/json"
 
-	bullmq "github.com/taskforcesh/bullmq/go"
+	bullmq "github.com/klerick/bullmq/go"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"

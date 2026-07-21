@@ -6,7 +6,7 @@ import (
 	"regexp"
 	"testing"
 
-	bullmq "github.com/taskforcesh/bullmq/go"
+	bullmq "github.com/klerick/bullmq/go"
 	"go.opentelemetry.io/otel"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/trace"
