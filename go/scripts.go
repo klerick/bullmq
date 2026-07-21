@@ -493,6 +493,107 @@ func (s *scripts) moveStalledJobsToWait(ctx context.Context, maxStalledCount int
 	return out, nil
 }
 
+// runJobMutation runs a job-level script that returns nothing on success (RESP
+// nil) but a negative status code on error (e.g. missing job).
+func (s *scripts) runJobMutation(ctx context.Context, name, jobID, command string, keys []string, args ...any) error {
+	res, err := s.run(ctx, name, keys, args...)
+	if err == redis.Nil {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if code, ok := res.(int64); ok && code < 0 {
+		return finishedError(ScriptErrorCode(code), errorContext{jobID: jobID, command: command})
+	}
+	return nil
+}
+
+func (s *scripts) updateProgress(ctx context.Context, jobID string, progress any) error {
+	pj, err := marshalJSON(progress)
+	if err != nil {
+		return err
+	}
+	keys := []string{s.keys.JobKey(jobID), s.keys.Events(), s.keys.Meta()}
+	return s.runJobMutation(ctx, "updateProgress", jobID, "updateProgress", keys, jobID, string(pj))
+}
+
+func (s *scripts) updateData(ctx context.Context, jobID string, data any) error {
+	dj, err := marshalJSON(data)
+	if err != nil {
+		return err
+	}
+	return s.runJobMutation(ctx, "updateData", jobID, "updateData", []string{s.keys.JobKey(jobID)}, string(dj))
+}
+
+// addLog appends a log row (RPUSH), trimming to keepLogs if > 0. From addLog-2.lua.
+func (s *scripts) addLog(ctx context.Context, jobID, logRow string, keepLogs int) (int64, error) {
+	keep := ""
+	if keepLogs > 0 {
+		keep = strconv.Itoa(keepLogs)
+	}
+	keys := []string{s.keys.JobKey(jobID), s.keys.JobKey(jobID) + ":logs"}
+	res, err := s.run(ctx, "addLog", keys, jobID, logRow, keep)
+	if err == redis.Nil {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	return toInt64(res), nil
+}
+
+func (s *scripts) promote(ctx context.Context, jobID string) error {
+	keys := []string{
+		s.keys.Delayed(), s.keys.Wait(), s.keys.Paused(), s.keys.Meta(), s.keys.Prioritized(),
+		s.keys.Active(), s.keys.PC(), s.keys.Events(), s.keys.Marker(),
+	}
+	return s.runJobMutation(ctx, "promote", jobID, "promote", keys, s.keys.KeyPrefix(), jobID)
+}
+
+func (s *scripts) changeDelay(ctx context.Context, jobID string, delay int64) error {
+	keys := []string{s.keys.Delayed(), s.keys.Meta(), s.keys.Marker(), s.keys.Events()}
+	return s.runJobMutation(ctx, "changeDelay", jobID, "changeDelay", keys, delay, nowMillis(), jobID, s.keys.JobKey(jobID))
+}
+
+func (s *scripts) changePriority(ctx context.Context, jobID string, priority int, lifo bool) error {
+	lifoStr := "0"
+	if lifo {
+		lifoStr = "1"
+	}
+	keys := []string{
+		s.keys.Wait(), s.keys.Paused(), s.keys.Meta(), s.keys.Prioritized(),
+		s.keys.Active(), s.keys.PC(), s.keys.Marker(),
+	}
+	return s.runJobMutation(ctx, "changePriority", jobID, "changePriority", keys, priority, s.keys.KeyPrefix(), jobID, lifoStr)
+}
+
+// reprocessJob moves a completed/failed job back to wait for reprocessing.
+// From reprocessJob-8.lua.
+func (s *scripts) reprocessJob(ctx context.Context, jobID, state string, lifo, resetAttemptsMade, resetAttemptsStarted bool) error {
+	pushCmd := "LPUSH"
+	if lifo {
+		pushCmd = "RPUSH"
+	}
+	propVal := "returnvalue"
+	if state == "failed" {
+		propVal = "failedReason"
+	}
+	keys := []string{
+		s.keys.JobKey(jobID), s.keys.Events(), s.keys.Get(state), s.keys.Wait(),
+		s.keys.Meta(), s.keys.Paused(), s.keys.Active(), s.keys.Marker(),
+	}
+	return s.runJobMutation(ctx, "reprocessJob", jobID, "reprocessJob", keys,
+		jobID, pushCmd, propVal, state, boolArg(resetAttemptsMade), boolArg(resetAttemptsStarted))
+}
+
+func boolArg(b bool) string {
+	if b {
+		return "1"
+	}
+	return "0"
+}
+
 // pause moves wait->paused (pause=true) or paused->wait (resume) and flips the
 // meta "paused" flag. From pause-7.lua.
 func (s *scripts) pause(ctx context.Context, pause bool) error {

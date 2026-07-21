@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 )
 
@@ -54,6 +55,7 @@ type Job struct {
 	RepeatJobKey    string
 	FailedReason    string
 	ReturnValue     any
+	Progress        any
 
 	opts      map[string]any // effective options (long keys)
 	discarded bool
@@ -268,6 +270,85 @@ func (j *Job) GetDependenciesCount(ctx context.Context) (int64, error) {
 		return 0, err
 	}
 	return counts[0], nil
+}
+
+// UpdateProgress stores a new progress value (any JSON-serialisable value).
+func (j *Job) UpdateProgress(ctx context.Context, progress any) error {
+	if err := j.queue.scripts.updateProgress(ctx, j.ID, progress); err != nil {
+		return err
+	}
+	j.Progress = progress
+	return nil
+}
+
+// UpdateData replaces the job's data.
+func (j *Job) UpdateData(ctx context.Context, data any) error {
+	if err := j.queue.scripts.updateData(ctx, j.ID, data); err != nil {
+		return err
+	}
+	j.Data = data
+	return nil
+}
+
+// Log appends a log line, returning the number of stored log lines. keepLogs
+// (from job options) trims older lines.
+func (j *Job) Log(ctx context.Context, line string) (int64, error) {
+	return j.queue.scripts.addLog(ctx, j.ID, line, int(toInt64(j.opts["keepLogs"])))
+}
+
+// GetLogs returns log lines in [start, end].
+func (j *Job) GetLogs(ctx context.Context, start, end int64) ([]string, error) {
+	return j.queue.conn.client.LRange(ctx, j.queue.keys.JobKey(j.ID)+":logs", start, end).Result()
+}
+
+// Promote moves a delayed job to the wait state immediately.
+func (j *Job) Promote(ctx context.Context) error {
+	if err := j.queue.scripts.promote(ctx, j.ID); err != nil {
+		return err
+	}
+	j.Delay = 0
+	return nil
+}
+
+// ChangeDelay updates a delayed job's delay (ms).
+func (j *Job) ChangeDelay(ctx context.Context, delay int64) error {
+	if err := j.queue.scripts.changeDelay(ctx, j.ID, delay); err != nil {
+		return err
+	}
+	j.Delay = delay
+	return nil
+}
+
+// ChangePriority updates a job's priority (lifo controls tie-break order).
+func (j *Job) ChangePriority(ctx context.Context, priority int, lifo bool) error {
+	if err := j.queue.scripts.changePriority(ctx, j.ID, priority, lifo); err != nil {
+		return err
+	}
+	j.Priority = priority
+	return nil
+}
+
+// Retry moves a completed/failed job back to wait to be processed again.
+func (j *Job) Retry(ctx context.Context, state string) error {
+	if state == "" {
+		state = "failed"
+	}
+	return j.queue.scripts.reprocessJob(ctx, j.ID, state, j.optBool("lifo"), false, false)
+}
+
+// Discard marks the job so it will not be retried if it fails during this run.
+func (j *Job) Discard() { j.discarded = true }
+
+// Remove deletes the job (and its children unless removeChildren is false).
+func (j *Job) Remove(ctx context.Context, removeChildren bool) error {
+	r, err := j.queue.scripts.removeJob(ctx, j.ID, removeChildren)
+	if err != nil {
+		return err
+	}
+	if r != 1 {
+		return fmt.Errorf("bullmq: job %s could not be removed (locked or missing)", j.ID)
+	}
+	return nil
 }
 
 // GetState returns the job's current state.
