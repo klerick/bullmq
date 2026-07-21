@@ -1,0 +1,10 @@
+{
+  "name": "bullmq-go-interop",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Node BullMQ pinned to the rawScripts version, used by the Go port's cross-runtime interop tests.",
+  "dependencies": {
+    "bullmq": "5.80.9"
+  }
+}
