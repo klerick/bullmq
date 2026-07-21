@@ -682,6 +682,19 @@ func (s *scripts) removeJob(ctx context.Context, jobID string, removeChildren bo
 	return toInt64(res), nil
 }
 
+// getRateLimitTtl returns the milliseconds until the queue's rate limit expires
+// (0 if not currently limited). From getRateLimitTtl-2.lua.
+func (s *scripts) getRateLimitTtl(ctx context.Context, maxJobs int) (int64, error) {
+	res, err := s.run(ctx, "getRateLimitTtl", []string{s.keys.Limiter(), s.keys.Meta()}, maxJobs)
+	if err == redis.Nil {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	return toInt64(res), nil
+}
+
 // transformStateType maps the public "waiting" type to its Redis key suffix "wait".
 func transformStateType(t string) string {
 	if t == "waiting" {

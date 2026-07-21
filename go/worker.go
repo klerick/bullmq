@@ -33,12 +33,12 @@ type Worker struct {
 	lockDuration    int64
 	stalledInterval int64
 	maxStalledCount int
+	limiter         *Limiter
 	drainDelay      time.Duration
 	id              string
 
 	drained    bool
 	blockUntil int64
-	limitUntil int64
 
 	mu     sync.Mutex
 	active map[string]string // jobID -> lock token, for lock renewal
@@ -75,6 +75,7 @@ func NewWorker(name string, processor Processor, opts ...Option) (*Worker, error
 		lockDuration:    lockDuration,
 		stalledInterval: stalledInterval,
 		maxStalledCount: maxStalledCount,
+		limiter:         cfg.limiter,
 		drainDelay:      defaultDrainDelay,
 		id:              genID(),
 		drained:         true,
@@ -149,18 +150,23 @@ func (w *Worker) getNextJob(ctx context.Context, token string) (*Job, error) {
 }
 
 func (w *Worker) moveToActive(ctx context.Context, token string) (*Job, error) {
+	var limiter any
+	if w.limiter != nil {
+		limiter = map[string]any{"max": w.limiter.Max, "duration": w.limiter.Duration}
+	}
 	jobData, jobID, limitUntil, delayUntil, err := w.queue.scripts.moveToActive(ctx, moveToActiveOpts{
 		token:        token,
 		lockDuration: w.lockDuration,
+		limiter:      limiter,
 	})
 	if err != nil {
 		return nil, err
 	}
-	if limitUntil > 0 {
-		w.limitUntil = limitUntil
-	}
 	if jobData == nil {
-		if delayUntil > 0 {
+		// A rate-limit or delayed-job wait: block until the queue can serve again.
+		if limitUntil > 0 {
+			w.blockUntil = nowMillis() + limitUntil
+		} else if delayUntil > 0 {
 			w.blockUntil = delayUntil
 		}
 		return nil, nil

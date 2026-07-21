@@ -3,9 +3,14 @@ package bullmq
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 )
+
+// maxSafeInteger matches JS Number.MAX_SAFE_INTEGER, the sentinel BullMQ writes to
+// the limiter key to rate-limit a whole queue.
+const maxSafeInteger = 9007199254740991
 
 // Queue adds jobs to a named queue. Construct it with NewQueue and functional
 // options (WithClient for DI, WithRedisOptions to build a client, WithPrefix).
@@ -305,6 +310,69 @@ func (q *Queue) AddBulk(ctx context.Context, specs []BulkJob) ([]*Job, error) {
 		jobs[i].ID = id
 	}
 	return jobs, nil
+}
+
+// ── Rate limiting & global controls ──────────────────────────────────────
+
+// SetGlobalConcurrency caps the total number of jobs processed concurrently
+// across all workers of this queue.
+func (q *Queue) SetGlobalConcurrency(ctx context.Context, n int) error {
+	return q.conn.client.HSet(ctx, q.keys.Meta(), "concurrency", n).Err()
+}
+
+// GetGlobalConcurrency returns the configured global concurrency (0 if unset).
+func (q *Queue) GetGlobalConcurrency(ctx context.Context) (int64, error) {
+	v, err := q.conn.client.HGet(ctx, q.keys.Meta(), "concurrency").Result()
+	if err == redis.Nil {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	return toInt64(v), nil
+}
+
+// RemoveGlobalConcurrency clears the global concurrency limit.
+func (q *Queue) RemoveGlobalConcurrency(ctx context.Context) error {
+	return q.conn.client.HDel(ctx, q.keys.Meta(), "concurrency").Err()
+}
+
+// SetGlobalRateLimit sets a queue-wide rate limit of max jobs per durationMs.
+func (q *Queue) SetGlobalRateLimit(ctx context.Context, max int, durationMs int64) error {
+	return q.conn.client.HSet(ctx, q.keys.Meta(), "max", max, "duration", durationMs).Err()
+}
+
+// GetGlobalRateLimit returns the configured (max, durationMs), zeroes if unset.
+func (q *Queue) GetGlobalRateLimit(ctx context.Context) (max, durationMs int64, err error) {
+	vals, err := q.conn.client.HMGet(ctx, q.keys.Meta(), "max", "duration").Result()
+	if err != nil {
+		return 0, 0, err
+	}
+	if len(vals) == 2 {
+		max = toInt64(vals[0])
+		durationMs = toInt64(vals[1])
+	}
+	return max, durationMs, nil
+}
+
+// RemoveGlobalRateLimit clears the queue-wide rate limit.
+func (q *Queue) RemoveGlobalRateLimit(ctx context.Context) error {
+	return q.conn.client.HDel(ctx, q.keys.Meta(), "max", "duration").Err()
+}
+
+// RateLimit rate-limits the whole queue for expireMs milliseconds.
+func (q *Queue) RateLimit(ctx context.Context, expireMs int64) error {
+	return q.conn.client.Set(ctx, q.keys.Limiter(), maxSafeInteger, time.Duration(expireMs)*time.Millisecond).Err()
+}
+
+// RemoveRateLimitKey clears an active rate limit, returning the keys removed.
+func (q *Queue) RemoveRateLimitKey(ctx context.Context) (int64, error) {
+	return q.conn.client.Del(ctx, q.keys.Limiter()).Result()
+}
+
+// GetRateLimitTtl returns the ms until the rate limit lifts (0 if not limited).
+func (q *Queue) GetRateLimitTtl(ctx context.Context, maxJobs int) (int64, error) {
+	return q.scripts.getRateLimitTtl(ctx, maxJobs)
 }
 
 // Name returns the queue name.

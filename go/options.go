@@ -15,6 +15,13 @@ type config struct {
 	lockDuration    int64 // milliseconds
 	stalledInterval int64 // milliseconds
 	maxStalledCount int
+	limiter         *Limiter
+}
+
+// Limiter rate-limits a worker to Max jobs per Duration (milliseconds).
+type Limiter struct {
+	Max      int
+	Duration int64
 }
 
 // Option customises a Queue/Worker/FlowProducer at construction time.
@@ -65,6 +72,11 @@ func WithStalledInterval(ms int64) Option {
 // state before being failed (default 1).
 func WithMaxStalledCount(n int) Option {
 	return func(cfg *config) { cfg.maxStalledCount = n }
+}
+
+// WithLimiter rate-limits the worker to max jobs per durationMs milliseconds.
+func WithLimiter(max int, durationMs int64) Option {
+	return func(cfg *config) { cfg.limiter = &Limiter{Max: max, Duration: durationMs} }
 }
 
 // newConfig applies options over the defaults.
