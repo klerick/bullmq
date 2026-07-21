@@ -21,6 +21,7 @@ type Queue struct {
 	conn    *connection
 	scripts *scripts
 	keys    QueueKeys
+	tel     telemetryHelper
 }
 
 // NewQueue creates a queue. The name must not be empty or contain ':'.
@@ -38,6 +39,7 @@ func NewQueue(name string, opts ...Option) (*Queue, error) {
 		prefix: cfg.prefix,
 		conn:   conn,
 		keys:   NewQueueKeys(name, cfg.prefix),
+		tel:    telemetryHelper{t: cfg.telemetry, name: name},
 	}
 	q.scripts = newScripts(conn, cfg.prefix, name)
 	return q, nil
@@ -45,12 +47,25 @@ func NewQueue(name string, opts ...Option) (*Queue, error) {
 
 // Add enqueues a job and returns it with its assigned id. A nil opts is allowed.
 func (q *Queue) Add(ctx context.Context, name string, data any, opts *JobOptions) (*Job, error) {
-	job := newJob(q, name, data, opts)
-	id, err := q.scripts.addJob(ctx, job)
+	var job *Job
+	err := q.tel.trace(ctx, SpanKindProducer, "add", func(ctx context.Context, span Span) error {
+		job = newJob(q, name, data, opts)
+		if md := q.tel.inject(ctx); md != "" {
+			job.opts["tm"] = md // propagate trace context to the consumer
+		}
+		id, e := q.scripts.addJob(ctx, job)
+		if e != nil {
+			return e
+		}
+		job.ID = id
+		if span != nil {
+			span.SetAttributes(map[string]any{"bullmq.queue": q.name, "bullmq.job.name": name, "bullmq.job.id": id})
+		}
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	job.ID = id
 	return job, nil
 }
 

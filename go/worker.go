@@ -235,14 +235,22 @@ func (w *Worker) processJob(ctx context.Context, job *Job) {
 	if w.metricsMaxDataPoints > 0 {
 		fo.maxMetricsSize = strconv.Itoa(w.metricsMaxDataPoints)
 	}
-	result, procErr := w.processor(ctx, job)
+
+	// Continue the trace started when the job was added (context travels in `tm`).
+	pctx := w.queue.tel.extract(ctx, toStr(job.opts["tm"]))
+	pctx, span := w.queue.tel.start(pctx, SpanKindConsumer, "process")
+	span.setAttrs(map[string]any{"bullmq.queue": w.queue.name, "bullmq.job.name": job.Name, "bullmq.job.id": job.ID})
+
+	result, procErr := w.processor(pctx, job)
 	if procErr != nil {
+		span.finish(procErr)
 		if errors.Is(procErr, ErrWaitingChildren) {
 			return // job intentionally left in waiting-children
 		}
 		_ = job.moveToFailed(ctx, procErr, fo, false)
 		return
 	}
+	span.finish(nil)
 	_ = job.moveToCompleted(ctx, result, fo, false)
 }
 

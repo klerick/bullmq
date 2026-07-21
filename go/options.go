@@ -9,6 +9,7 @@ type config struct {
 	client         redis.UniversalClient
 	blockingClient redis.UniversalClient
 	redisOptions   *redis.Options
+	telemetry      Telemetry
 
 	// worker-only
 	concurrency          int
@@ -54,6 +55,13 @@ func WithRedisOptions(o *redis.Options) Option {
 // WithPrefix overrides the key prefix (default "bull").
 func WithPrefix(prefix string) Option {
 	return func(cfg *config) { cfg.prefix = prefix }
+}
+
+// WithTelemetry enables distributed tracing via the given Telemetry implementation
+// (e.g. bullmq/otel). Trace context propagates through jobs so add and process
+// spans link across processes and runtimes.
+func WithTelemetry(t Telemetry) Option {
+	return func(cfg *config) { cfg.telemetry = t }
 }
 
 // WithConcurrency sets how many jobs a Worker processes in parallel (default 1).
