@@ -62,7 +62,7 @@ cross-runtime tests against Node BullMQ (see `interop_test.go`, `cron_interop_te
 | Job scheduler next-iteration production           | ✅       |
 | Events (via QueueEvents)                          | ✅       |
 | Telemetry / OpenTelemetry (via bullmq/otel)       | ✅       |
-| Custom backoff strategies                         | ❌       |
+| Custom backoff strategies (WithBackoffStrategy)   | ✅       |
 | Sandboxed processors                              | ❌ (N/A) |
 
 ## Job features
@@ -74,14 +74,14 @@ cross-runtime tests against Node BullMQ (see `interop_test.go`, `cron_interop_te
 | MoveToCompleted / MoveToFailed (full retry) / MoveToWaitingChildren                      | ✅     |
 | Promote / ChangeDelay / ChangePriority / Retry / Discard / Remove                        | ✅     |
 | GetChildrenValues / GetDependenciesCount                                                 | ✅     |
-| sizeLimit                                                                                | ❌     |
+| sizeLimit                                                                                | ✅     |
 
 ## Job options
 
 delay ✅ · priority ✅ · attempts ✅ · backoff (fixed/exponential/jitter) ✅ · lifo ✅ ·
 jobId ✅ · removeOnComplete/removeOnFail ✅ · deduplication ✅ · repeat/cron ✅ · parent ✅ ·
 failParentOnFailure / removeDependencyOnFailure / ignoreDependencyOnFailure /
-continueParentOnFailure ✅ (stored) · keepLogs 🚧 · sizeLimit ❌ · telemetry ✅ (trace propagation via tm)
+continueParentOnFailure ✅ (stored) · keepLogs 🚧 · sizeLimit ✅ · telemetry ✅ (trace propagation via tm)
 
 ## Connection & infrastructure
 

@@ -5,13 +5,19 @@ import (
 	"math/rand"
 )
 
-// BackoffOptions configures retry backoff. Type is "fixed" or "exponential".
-// Jitter (0..1) randomises the delay down to delay*(1-jitter).
+// BackoffOptions configures retry backoff. Type is "fixed", "exponential", or a
+// custom name resolved by a BackoffStrategy. Jitter (0..1) randomises a builtin
+// delay down to delay*(1-jitter).
 type BackoffOptions struct {
 	Type   string
 	Delay  int64   // milliseconds
 	Jitter float64 // 0..1
 }
+
+// BackoffStrategy computes a retry delay (ms) for a job whose backoff type is not
+// a builtin. Return -1 to stop retrying (move straight to failed). Registered with
+// WithBackoffStrategy.
+type BackoffStrategy func(attemptsMade int, backoffType string, err error, job *Job) int64
 
 // normalizeBackoff turns typed backoff options into the stored map form
 // ({type, delay[, jitter]}), mirroring Backoffs.normalize.

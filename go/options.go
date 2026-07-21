@@ -5,11 +5,12 @@ import "github.com/redis/go-redis/v9"
 // config holds the settings shared by Queue, Worker and FlowProducer. It is
 // populated through functional Options. Worker-only fields are ignored by Queue.
 type config struct {
-	prefix         string
-	client         redis.UniversalClient
-	blockingClient redis.UniversalClient
-	redisOptions   *redis.Options
-	telemetry      Telemetry
+	prefix          string
+	client          redis.UniversalClient
+	blockingClient  redis.UniversalClient
+	redisOptions    *redis.Options
+	telemetry       Telemetry
+	backoffStrategy BackoffStrategy
 
 	// worker-only
 	concurrency          int
@@ -110,6 +111,12 @@ func WithSkipLockRenewal() Option {
 // (capped at maxDataPoints), readable via Queue.GetMetrics.
 func WithMetrics(maxDataPoints int) Option {
 	return func(cfg *config) { cfg.metricsMaxDataPoints = maxDataPoints }
+}
+
+// WithBackoffStrategy registers a custom backoff strategy used for jobs whose
+// backoff type is not "fixed" or "exponential".
+func WithBackoffStrategy(fn BackoffStrategy) Option {
+	return func(cfg *config) { cfg.backoffStrategy = fn }
 }
 
 // newConfig applies options over the defaults.

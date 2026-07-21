@@ -53,6 +53,9 @@ func (s *scripts) addJobArgs(job *Job) ([]any, error) {
 	if err != nil {
 		return nil, err
 	}
+	if job.sizeLimit > 0 && len(jsonData) > job.sizeLimit {
+		return nil, fmt.Errorf("%w: job data is %d bytes, exceeding sizeLimit %d", ErrInvalidConfig, len(jsonData), job.sizeLimit)
+	}
 	packedOpts, err := packMsgpack(encodeOpts(job.optsMap()))
 	if err != nil {
 		return nil, err

@@ -16,12 +16,13 @@ const maxSafeInteger = 9007199254740991
 // Queue adds jobs to a named queue. Construct it with NewQueue and functional
 // options (WithClient for DI, WithRedisOptions to build a client, WithPrefix).
 type Queue struct {
-	name    string
-	prefix  string
-	conn    *connection
-	scripts *scripts
-	keys    QueueKeys
-	tel     telemetryHelper
+	name            string
+	prefix          string
+	conn            *connection
+	scripts         *scripts
+	keys            QueueKeys
+	tel             telemetryHelper
+	backoffStrategy BackoffStrategy
 }
 
 // NewQueue creates a queue. The name must not be empty or contain ':'.
@@ -35,11 +36,12 @@ func NewQueue(name string, opts ...Option) (*Queue, error) {
 		return nil, err
 	}
 	q := &Queue{
-		name:   name,
-		prefix: cfg.prefix,
-		conn:   conn,
-		keys:   NewQueueKeys(name, cfg.prefix),
-		tel:    telemetryHelper{t: cfg.telemetry, name: name},
+		name:            name,
+		prefix:          cfg.prefix,
+		conn:            conn,
+		keys:            NewQueueKeys(name, cfg.prefix),
+		tel:             telemetryHelper{t: cfg.telemetry, name: name},
+		backoffStrategy: cfg.backoffStrategy,
 	}
 	q.scripts = newScripts(conn, cfg.prefix, name)
 	return q, nil

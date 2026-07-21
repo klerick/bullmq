@@ -30,6 +30,7 @@ type JobOptions struct {
 	Backoff          *BackoffOptions
 	Timestamp        int64 // milliseconds; 0 means "now"
 	Lifo             bool
+	SizeLimit        int // max job-data size in bytes (0 = unlimited)
 	RemoveOnComplete any // bool | int | map{count,age}
 	RemoveOnFail     any
 	Parent           *ParentOptions
@@ -58,6 +59,7 @@ type Job struct {
 	Progress        any
 
 	opts      map[string]any // effective options (long keys)
+	sizeLimit int
 	discarded bool
 	token     string
 	queue     *Queue
@@ -84,6 +86,7 @@ func newJob(queue *Queue, name string, data any, o *JobOptions) *Job {
 		Priority:  o.Priority,
 		Attempts:  o.Attempts,
 		opts:      opts,
+		sizeLimit: o.SizeLimit,
 		queue:     queue,
 	}
 	if o.Parent != nil {
@@ -207,6 +210,12 @@ func (j *Job) moveToFailed(ctx context.Context, jobErr error, fo finishOpts, fet
 	moveToFailed := false
 	if (j.AttemptsMade+1) < j.Attempts && !j.discarded && !unrecoverable {
 		delay := calculateBackoff(j.backoffMap(), j.AttemptsMade+1)
+		// A non-builtin backoff type (calculateBackoff returns -1) defers to a
+		// registered custom strategy, if any.
+		if delay == -1 && j.queue.backoffStrategy != nil {
+			bt, _ := j.backoffMap()["type"].(string)
+			delay = j.queue.backoffStrategy(j.AttemptsMade+1, bt, jobErr, j)
+		}
 		switch {
 		case delay == -1:
 			moveToFailed = true
