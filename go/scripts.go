@@ -682,6 +682,79 @@ func (s *scripts) removeJob(ctx context.Context, jobID string, removeChildren bo
 	return toInt64(res), nil
 }
 
+// addJobScheduler creates/overrides a job scheduler and produces its first job.
+// Returns the produced job id and its delay. From addJobScheduler-11.lua.
+func (s *scripts) addJobScheduler(ctx context.Context, schedulerID string, nextMillis int64, templateData string, templateOpts, schedulerOpts, delayedOpts map[string]any, producerKey string) (string, int64, error) {
+	keys := []string{
+		s.keys.Repeat(), s.keys.Delayed(), s.keys.Wait(), s.keys.Paused(), s.keys.Meta(),
+		s.keys.Prioritized(), s.keys.Marker(), s.keys.ID(), s.keys.Events(), s.keys.PC(), s.keys.Active(),
+	}
+	ps, _ := packMsgpack(schedulerOpts)
+	pt, _ := packMsgpack(templateOpts)
+	pd, _ := packMsgpack(delayedOpts)
+	args := []any{nextMillis, ps, schedulerID, templateData, pt, pd, nowMillis(), s.keys.KeyPrefix(), producerKey}
+	res, err := s.run(ctx, "addJobScheduler", keys, args...)
+	if err != nil {
+		return "", 0, err
+	}
+	arr, _ := res.([]any)
+	if len(arr) >= 2 {
+		return toStr(arr[0]), toInt64(arr[1]), nil
+	}
+	return "", 0, nil
+}
+
+// updateJobSchedulerNextMillis schedules the next iteration of an existing
+// scheduler (override=false path). From updateJobScheduler-12.lua.
+func (s *scripts) updateJobSchedulerNextMillis(ctx context.Context, schedulerID string, nextMillis int64, templateData string, delayedOpts map[string]any, producerID string) (string, error) {
+	producerKey := ""
+	if producerID != "" {
+		producerKey = s.keys.JobKey(producerID)
+	}
+	keys := []string{
+		s.keys.Repeat(), s.keys.Delayed(), s.keys.Wait(), s.keys.Paused(), s.keys.Meta(),
+		s.keys.Prioritized(), s.keys.Marker(), s.keys.ID(), s.keys.Events(), s.keys.PC(), producerKey, s.keys.Active(),
+	}
+	pd, _ := packMsgpack(delayedOpts)
+	args := []any{nextMillis, schedulerID, templateData, pd, nowMillis(), s.keys.KeyPrefix(), producerID}
+	res, err := s.run(ctx, "updateJobScheduler", keys, args...)
+	if err == redis.Nil {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return toStr(res), nil
+}
+
+// getJobScheduler returns a scheduler's stored fields and its next-run millis
+// (nil map if absent). From getJobScheduler-1.lua.
+func (s *scripts) getJobScheduler(ctx context.Context, id string) (map[string]string, int64, error) {
+	res, err := s.run(ctx, "getJobScheduler", []string{s.keys.Repeat()}, id)
+	if err != nil {
+		return nil, 0, err
+	}
+	arr, _ := res.([]any)
+	if len(arr) < 2 || arr[0] == nil {
+		return nil, 0, nil
+	}
+	flat, _ := arr[0].([]any)
+	return flatArrayToMap(flat), toInt64(arr[1]), nil
+}
+
+// removeJobScheduler removes a scheduler and its pending delayed job.
+// From removeJobScheduler-3.lua.
+func (s *scripts) removeJobScheduler(ctx context.Context, id string) (int64, error) {
+	res, err := s.run(ctx, "removeJobScheduler", []string{s.keys.Repeat(), s.keys.Delayed(), s.keys.Events()}, id, s.keys.KeyPrefix())
+	if err == redis.Nil {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	return toInt64(res), nil
+}
+
 // getRateLimitTtl returns the milliseconds until the queue's rate limit expires
 // (0 if not currently limited). From getRateLimitTtl-2.lua.
 func (s *scripts) getRateLimitTtl(ctx context.Context, maxJobs int) (int64, error) {

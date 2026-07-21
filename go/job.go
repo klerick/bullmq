@@ -69,31 +69,7 @@ func newJob(queue *Queue, name string, data any, o *JobOptions) *Job {
 	if o == nil {
 		o = &JobOptions{}
 	}
-	opts := map[string]any{
-		"attempts": o.Attempts,
-		"delay":    o.Delay,
-	}
-	if o.Priority != 0 {
-		opts["priority"] = o.Priority
-	}
-	if o.Backoff != nil {
-		opts["backoff"] = normalizeBackoff(o.Backoff)
-	}
-	if o.Lifo {
-		opts["lifo"] = true
-	}
-	if o.RemoveOnComplete != nil {
-		opts["removeOnComplete"] = o.RemoveOnComplete
-	}
-	if o.RemoveOnFail != nil {
-		opts["removeOnFail"] = o.RemoveOnFail
-	}
-	if o.Deduplication != nil {
-		opts["deduplication"] = map[string]any{"id": o.Deduplication.ID}
-	}
-	for k, v := range o.Extra {
-		opts[k] = v
-	}
+	opts := buildOptsMap(o)
 
 	timestamp := o.Timestamp
 	if timestamp == 0 {
@@ -141,6 +117,7 @@ func jobFromRaw(queue *Queue, raw map[string]string, jobID string) *Job {
 		AttemptsStarted: int(toInt64(raw["ats"])),
 		FailedReason:    raw["failedReason"],
 		ParentKey:       raw["parentKey"],
+		RepeatJobKey:    raw["rjk"],
 		opts:            opts,
 		queue:           queue,
 	}
@@ -156,6 +133,36 @@ func jobFromRaw(queue *Queue, raw map[string]string, jobID string) *Job {
 		}
 	}
 	return j
+}
+
+// buildOptsMap turns typed JobOptions into the effective options map (long keys).
+func buildOptsMap(o *JobOptions) map[string]any {
+	opts := map[string]any{
+		"attempts": o.Attempts,
+		"delay":    o.Delay,
+	}
+	if o.Priority != 0 {
+		opts["priority"] = o.Priority
+	}
+	if o.Backoff != nil {
+		opts["backoff"] = normalizeBackoff(o.Backoff)
+	}
+	if o.Lifo {
+		opts["lifo"] = true
+	}
+	if o.RemoveOnComplete != nil {
+		opts["removeOnComplete"] = o.RemoveOnComplete
+	}
+	if o.RemoveOnFail != nil {
+		opts["removeOnFail"] = o.RemoveOnFail
+	}
+	if o.Deduplication != nil {
+		opts["deduplication"] = map[string]any{"id": o.Deduplication.ID}
+	}
+	for k, v := range o.Extra {
+		opts[k] = v
+	}
+	return opts
 }
 
 // optsMap returns the effective options map for packing/storing.
