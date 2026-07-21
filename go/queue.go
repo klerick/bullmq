@@ -174,6 +174,26 @@ func (q *Queue) GetMeta(ctx context.Context) (map[string]string, error) {
 	return q.conn.client.HGetAll(ctx, q.keys.Meta()).Result()
 }
 
+// Metrics is a raw job time series recorded by a worker's metrics option. It is
+// intentionally raw data (no exposition format) so callers can feed it into their
+// own prometheus/client_golang collectors.
+type Metrics struct {
+	Count     int64   // total jobs of this type recorded
+	PrevTS    int64   // timestamp of the last recorded data point (ms)
+	PrevCount int64   // job count at the previous data point
+	NumPoints int64   // total data points available
+	Data      []int64 // per-minute counts within the requested window
+}
+
+// GetMetrics returns the recorded time series for "completed" or "failed" jobs in
+// the data-point window [start, end] (end -1 = to the latest).
+func (q *Queue) GetMetrics(ctx context.Context, metricType string, start, end int64) (*Metrics, error) {
+	if metricType != "completed" && metricType != "failed" {
+		return nil, fmt.Errorf("%w: metric type must be \"completed\" or \"failed\", got %q", ErrInvalidConfig, metricType)
+	}
+	return q.scripts.getMetrics(ctx, metricType, start, end)
+}
+
 // Pause stops the queue from handing out new jobs (wait -> paused).
 func (q *Queue) Pause(ctx context.Context) error { return q.scripts.pause(ctx, true) }
 

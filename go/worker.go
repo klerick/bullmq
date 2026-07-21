@@ -27,18 +27,19 @@ type Processor func(ctx context.Context, job *Job) (any, error)
 // with NewWorker and the same functional options as Queue, plus WithConcurrency /
 // WithLockDuration.
 type Worker struct {
-	queue            *Queue
-	processor        Processor
-	concurrency      int
-	lockDuration     int64
-	stalledInterval  int64
-	maxStalledCount  int
-	limiter          *Limiter
-	workerName       string
-	skipStalledCheck bool
-	skipLockRenewal  bool
-	drainDelay       time.Duration
-	id               string
+	queue                *Queue
+	processor            Processor
+	concurrency          int
+	lockDuration         int64
+	stalledInterval      int64
+	maxStalledCount      int
+	limiter              *Limiter
+	workerName           string
+	skipStalledCheck     bool
+	skipLockRenewal      bool
+	metricsMaxDataPoints int
+	drainDelay           time.Duration
+	id                   string
 
 	drained    bool
 	blockUntil int64
@@ -72,20 +73,21 @@ func NewWorker(name string, processor Processor, opts ...Option) (*Worker, error
 		maxStalledCount = defaultMaxStalledCount
 	}
 	return &Worker{
-		queue:            q,
-		processor:        processor,
-		concurrency:      concurrency,
-		lockDuration:     lockDuration,
-		stalledInterval:  stalledInterval,
-		maxStalledCount:  maxStalledCount,
-		limiter:          cfg.limiter,
-		workerName:       cfg.workerName,
-		skipStalledCheck: cfg.skipStalledCheck,
-		skipLockRenewal:  cfg.skipLockRenewal,
-		drainDelay:       defaultDrainDelay,
-		id:               genID(),
-		drained:          true,
-		active:           make(map[string]string),
+		queue:                q,
+		processor:            processor,
+		concurrency:          concurrency,
+		lockDuration:         lockDuration,
+		stalledInterval:      stalledInterval,
+		maxStalledCount:      maxStalledCount,
+		limiter:              cfg.limiter,
+		workerName:           cfg.workerName,
+		skipStalledCheck:     cfg.skipStalledCheck,
+		skipLockRenewal:      cfg.skipLockRenewal,
+		metricsMaxDataPoints: cfg.metricsMaxDataPoints,
+		drainDelay:           defaultDrainDelay,
+		id:                   genID(),
+		drained:              true,
+		active:               make(map[string]string),
 	}, nil
 }
 
@@ -229,6 +231,9 @@ func (w *Worker) processJob(ctx context.Context, job *Job) {
 		lockDuration:     w.lockDuration,
 		removeOnComplete: job.opts["removeOnComplete"],
 		removeOnFail:     job.opts["removeOnFail"],
+	}
+	if w.metricsMaxDataPoints > 0 {
+		fo.maxMetricsSize = strconv.Itoa(w.metricsMaxDataPoints)
 	}
 	result, procErr := w.processor(ctx, job)
 	if procErr != nil {

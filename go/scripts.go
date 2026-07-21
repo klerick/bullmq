@@ -268,6 +268,7 @@ type finishOpts struct {
 	limiter          any
 	removeOnComplete any
 	removeOnFail     any
+	maxMetricsSize   string // "" disables metrics recording
 }
 
 // moveToCompleted moves the job to the completed set with a JSON-encoded return value.
@@ -304,7 +305,7 @@ func (s *scripts) moveToFinishedArgs(job *Job, value, propName, target string, f
 		"lockDuration":   fo.lockDuration,
 		"attempts":       job.Attempts,
 		"attemptsMade":   job.AttemptsMade,
-		"maxMetricsSize": "",
+		"maxMetricsSize": fo.maxMetricsSize,
 		"fpof":           job.optBool("failParentOnFailure"),
 		"cpof":           job.optBool("continueParentOnFailure"),
 		"idof":           job.optBool("ignoreDependencyOnFailure"),
@@ -753,6 +754,43 @@ func (s *scripts) removeJobScheduler(ctx context.Context, id string) (int64, err
 		return 0, err
 	}
 	return toInt64(res), nil
+}
+
+// getMetrics reads a job time series (completed/failed) recorded by the worker's
+// metrics option. Returns {count, prevTS, prevCount}, the data-point window in
+// [start, end], and the total number of points. From getMetrics-2.lua.
+func (s *scripts) getMetrics(ctx context.Context, metricType string, start, end int64) (*Metrics, error) {
+	metricsKey := s.keys.Get("metrics:" + metricType)
+	res, err := s.run(ctx, "getMetrics", []string{metricsKey, metricsKey + ":data"}, start, end)
+	if err != nil {
+		return nil, err
+	}
+	arr, _ := res.([]any)
+	m := &Metrics{}
+	if len(arr) >= 1 {
+		if meta, ok := arr[0].([]any); ok {
+			if len(meta) >= 1 {
+				m.Count = toInt64(meta[0])
+			}
+			if len(meta) >= 2 {
+				m.PrevTS = toInt64(meta[1])
+			}
+			if len(meta) >= 3 {
+				m.PrevCount = toInt64(meta[2])
+			}
+		}
+	}
+	if len(arr) >= 2 {
+		if data, ok := arr[1].([]any); ok {
+			for _, d := range data {
+				m.Data = append(m.Data, toInt64(d))
+			}
+		}
+	}
+	if len(arr) >= 3 {
+		m.NumPoints = toInt64(arr[2])
+	}
+	return m, nil
 }
 
 // getRateLimitTtl returns the milliseconds until the queue's rate limit expires

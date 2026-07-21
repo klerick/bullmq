@@ -45,7 +45,8 @@ cross-runtime tests against Node BullMQ (see `interop_test.go`, `cron_interop_te
 | UpsertJobScheduler / RemoveJobScheduler / GetJobScheduler(s) / GetJobSchedulersCount | ✅     |
 | GetDeduplicationJobID / RemoveDeduplicationKey (+ deprecated debounce aliases)       | ✅     |
 | GetWorkers / GetWorkersCount                                                         | ✅     |
-| GetMetrics / ExportPrometheusMetrics                                                 | ❌     |
+| GetMetrics (raw time series)                                                         | ✅     |
+| ExportPrometheusMetrics (build a collector from GetMetrics/GetJobCounts instead)     | ❌     |
 | RemoveOrphanedJobs / legacy repeatable API                                           | ❌     |
 
 ## Worker features
