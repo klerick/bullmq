@@ -35,6 +35,16 @@ func (s *scripts) run(ctx context.Context, name string, keys []string, args ...a
 	return script.Run(ctx, s.conn.client, keys, args...).Result()
 }
 
+// runVoid executes a script that returns nothing. A Lua script with no return
+// value yields a RESP nil, which go-redis surfaces as redis.Nil — not an error here.
+func (s *scripts) runVoid(ctx context.Context, name string, keys []string, args ...any) error {
+	_, err := s.run(ctx, name, keys, args...)
+	if err == redis.Nil {
+		return nil
+	}
+	return err
+}
+
 // addJobArgs builds the three ARGV values shared by all add-scripts:
 // [ pack(argsArray), jsonData, pack(encodedOpts) ]. The 9-element argsArray layout
 // is the cross-port contract (see addStandardJob-9.lua and TS scripts.ts::addJob).
@@ -481,6 +491,94 @@ func (s *scripts) moveStalledJobsToWait(ctx context.Context, maxStalledCount int
 		out = append(out, toStr(v))
 	}
 	return out, nil
+}
+
+// pause moves wait->paused (pause=true) or paused->wait (resume) and flips the
+// meta "paused" flag. From pause-7.lua.
+func (s *scripts) pause(ctx context.Context, pause bool) error {
+	src, dst, arg := "wait", "paused", "paused"
+	if !pause {
+		src, dst, arg = "paused", "wait", "resumed"
+	}
+	keys := []string{
+		s.keys.Get(src), s.keys.Get(dst), s.keys.Meta(), s.keys.Prioritized(),
+		s.keys.Events(), s.keys.Delayed(), s.keys.Marker(),
+	}
+	return s.runVoid(ctx, "pause", keys, arg)
+}
+
+// drain removes waiting/prioritized (and optionally delayed) jobs. From drain-5.lua.
+func (s *scripts) drain(ctx context.Context, delayed bool) error {
+	keys := []string{s.keys.Wait(), s.keys.Paused(), s.keys.Delayed(), s.keys.Prioritized(), s.keys.Repeat()}
+	d := "0"
+	if delayed {
+		d = "1"
+	}
+	return s.runVoid(ctx, "drain", keys, s.keys.KeyPrefix(), d)
+}
+
+// cleanJobsInSet removes jobs older than grace (ms) from a set, up to limit
+// (0 = no limit). Returns the removed job ids. From cleanJobsInSet-3.lua.
+func (s *scripts) cleanJobsInSet(ctx context.Context, set string, grace, limit int64) ([]string, error) {
+	set = transformStateType(set)
+	keys := []string{s.keys.Get(set), s.keys.Events(), s.keys.Repeat()}
+	args := []any{s.keys.KeyPrefix(), nowMillis() - grace, limit, set}
+	res, err := s.run(ctx, "cleanJobsInSet", keys, args...)
+	if err == redis.Nil {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	arr, _ := res.([]any)
+	out := make([]string, len(arr))
+	for i, v := range arr {
+		out[i] = toStr(v)
+	}
+	return out, nil
+}
+
+// moveJobsToWait bulk-moves jobs from a source state back to wait. Used by
+// retryJobs (state completed/failed) and promoteJobs (state delayed). Returns 1 if
+// more remain (hit count), 0 when done. From moveJobsToWait-8.lua.
+func (s *scripts) moveJobsToWait(ctx context.Context, state string, count int, timestamp int64) (int64, error) {
+	keys := []string{
+		s.keys.KeyPrefix(), s.keys.Events(), s.keys.Get(state), s.keys.Wait(),
+		s.keys.Paused(), s.keys.Meta(), s.keys.Active(), s.keys.Marker(),
+	}
+	res, err := s.run(ctx, "moveJobsToWait", keys, count, timestamp, state)
+	if err != nil {
+		return 0, err
+	}
+	return toInt64(res), nil
+}
+
+// obliterate removes up to count jobs of the (paused) queue. Returns 1 if more
+// remain, 0 when done, -1 if not paused, -2 if active jobs without force.
+// From obliterate-2.lua.
+func (s *scripts) obliterate(ctx context.Context, count int, force bool) (int64, error) {
+	forceArg := ""
+	if force {
+		forceArg = "force"
+	}
+	res, err := s.run(ctx, "obliterate", []string{s.keys.Meta(), s.keys.KeyPrefix()}, count, forceArg)
+	if err != nil {
+		return 0, err
+	}
+	return toInt64(res), nil
+}
+
+// removeJob removes a job (and optionally its children). From removeJob-2.lua.
+func (s *scripts) removeJob(ctx context.Context, jobID string, removeChildren bool) (int64, error) {
+	rc := 0
+	if removeChildren {
+		rc = 1
+	}
+	res, err := s.run(ctx, "removeJob", []string{s.keys.JobKey(jobID), s.keys.Repeat()}, jobID, rc, s.keys.KeyPrefix())
+	if err != nil {
+		return 0, err
+	}
+	return toInt64(res), nil
 }
 
 // transformStateType maps the public "waiting" type to its Redis key suffix "wait".

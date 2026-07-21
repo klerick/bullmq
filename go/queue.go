@@ -1,6 +1,11 @@
 package bullmq
 
-import "context"
+import (
+	"context"
+	"fmt"
+
+	"github.com/redis/go-redis/v9"
+)
 
 // Queue adds jobs to a named queue. Construct it with NewQueue and functional
 // options (WithClient for DI, WithRedisOptions to build a client, WithPrefix).
@@ -161,6 +166,145 @@ func (q *Queue) IsMaxed(ctx context.Context) (bool, error) {
 // GetMeta returns the queue's meta hash.
 func (q *Queue) GetMeta(ctx context.Context) (map[string]string, error) {
 	return q.conn.client.HGetAll(ctx, q.keys.Meta()).Result()
+}
+
+// Pause stops the queue from handing out new jobs (wait -> paused).
+func (q *Queue) Pause(ctx context.Context) error { return q.scripts.pause(ctx, true) }
+
+// Resume undoes Pause (paused -> wait).
+func (q *Queue) Resume(ctx context.Context) error { return q.scripts.pause(ctx, false) }
+
+// IsPaused reports whether the queue is paused.
+func (q *Queue) IsPaused(ctx context.Context) (bool, error) {
+	return q.conn.client.HExists(ctx, q.keys.Meta(), "paused").Result()
+}
+
+// Drain removes waiting and prioritized jobs (and delayed if includeDelayed).
+// Active, completed and failed jobs are left untouched.
+func (q *Queue) Drain(ctx context.Context, includeDelayed bool) error {
+	return q.scripts.drain(ctx, includeDelayed)
+}
+
+// Clean removes jobs older than grace (ms) from a state set, up to limit
+// (0 = unlimited). Returns the removed job ids.
+func (q *Queue) Clean(ctx context.Context, grace, limit int64, state string) ([]string, error) {
+	return q.scripts.cleanJobsInSet(ctx, state, grace, limit)
+}
+
+// RetryJobs moves failed (or completed) jobs back to wait, in batches of count.
+func (q *Queue) RetryJobs(ctx context.Context, state string, count int) error {
+	if state == "" {
+		state = "failed"
+	}
+	for {
+		more, err := q.scripts.moveJobsToWait(ctx, state, count, nowMillis())
+		if err != nil {
+			return err
+		}
+		if more == 0 {
+			return nil
+		}
+	}
+}
+
+// PromoteJobs moves delayed jobs to wait, in batches of count.
+func (q *Queue) PromoteJobs(ctx context.Context, count int) error {
+	for {
+		// A far-future timestamp promotes all delayed jobs regardless of their time.
+		more, err := q.scripts.moveJobsToWait(ctx, "delayed", count, 1<<62)
+		if err != nil {
+			return err
+		}
+		if more == 0 {
+			return nil
+		}
+	}
+}
+
+// Obliterate pauses the queue and removes it entirely. With force it also removes
+// active jobs.
+func (q *Queue) Obliterate(ctx context.Context, force bool) error {
+	if err := q.Pause(ctx); err != nil {
+		return err
+	}
+	for {
+		r, err := q.scripts.obliterate(ctx, 1000, force)
+		if err != nil {
+			return err
+		}
+		switch r {
+		case -1:
+			return fmt.Errorf("%w: cannot obliterate a non-paused queue", ErrInvalidConfig)
+		case -2:
+			return fmt.Errorf("%w: cannot obliterate a queue with active jobs (use force)", ErrInvalidConfig)
+		case 0:
+			return nil
+		}
+	}
+}
+
+// Remove deletes a job (and its children unless removeChildren is false). Returns
+// true if the job was removed.
+func (q *Queue) Remove(ctx context.Context, id string, removeChildren bool) (bool, error) {
+	r, err := q.scripts.removeJob(ctx, id, removeChildren)
+	return r == 1, err
+}
+
+// TrimEvents caps the events stream to maxLen entries.
+func (q *Queue) TrimEvents(ctx context.Context, maxLen int64) (int64, error) {
+	return q.conn.client.XTrimMaxLen(ctx, q.keys.Events(), maxLen).Result()
+}
+
+// GetVersion returns the queue's stored library version, if any.
+func (q *Queue) GetVersion(ctx context.Context) (string, error) {
+	v, err := q.conn.client.HGet(ctx, q.keys.Meta(), "version").Result()
+	if err == redis.Nil {
+		return "", nil
+	}
+	return v, err
+}
+
+// BulkJob describes one job for AddBulk.
+type BulkJob struct {
+	Name string
+	Data any
+	Opts *JobOptions
+}
+
+// AddBulk enqueues many jobs in a single pipeline and returns them with ids.
+func (q *Queue) AddBulk(ctx context.Context, specs []BulkJob) ([]*Job, error) {
+	if err := q.conn.LoadScripts(ctx); err != nil {
+		return nil, err
+	}
+	jobs := make([]*Job, len(specs))
+	cmds := make([]*redis.Cmd, len(specs))
+	_, err := q.conn.client.Pipelined(ctx, func(pipe redis.Pipeliner) error {
+		for i, spec := range specs {
+			job := newJob(q, spec.Name, spec.Data, spec.Opts)
+			jobs[i] = job
+			cmd, e := q.scripts.enqueueAddJob(ctx, pipe, job)
+			if e != nil {
+				return e
+			}
+			cmds[i] = cmd
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	for i, cmd := range cmds {
+		res, e := cmd.Result()
+		if e != nil {
+			return nil, e
+		}
+		id, e := parseAddResult(res, jobs[i].ParentKey)
+		if e != nil {
+			return nil, e
+		}
+		jobs[i].ID = id
+	}
+	return jobs, nil
 }
 
 // Name returns the queue name.
