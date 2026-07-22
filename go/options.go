@@ -31,7 +31,7 @@ type Limiter struct {
 }
 
 // Option customises a Queue/Worker/FlowProducer at construction time.
-// The functional-options pattern keeps the API DI-friendly (see PLAN §3).
+// The functional-options pattern keeps the API DI-friendly.
 type Option func(*config)
 
 // WithClient injects an already-built Redis client. This is the primary path for

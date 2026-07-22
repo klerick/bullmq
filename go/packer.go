@@ -44,7 +44,7 @@ func encodeOpts(opts map[string]any) map[string]any {
 // marshalJSON encodes v as compact JSON WITHOUT HTML escaping, matching the wire
 // format Node (JSON.stringify) and Python (separators=(',',':')) produce. Go's
 // json.Marshal always HTML-escapes, so we use an Encoder with SetEscapeHTML(false)
-// and trim the trailing newline it appends. See PLAN §5.
+// and trim the trailing newline it appends.
 func marshalJSON(v any) ([]byte, error) {
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
@@ -57,7 +57,7 @@ func marshalJSON(v any) ([]byte, error) {
 
 // packMsgpack encodes v as msgpack. BullMQ's Lua scripts unpack these via
 // cmsgpack, which is format-agnostic (int vs float, fixmap vs map16), so the
-// exact bytes need not match Node/Python — only the decoded values must. See PLAN §5.
+// exact bytes need not match Node/Python — only the decoded values must.
 func packMsgpack(v any) ([]byte, error) {
 	return msgpack.Marshal(v)
 }

@@ -38,11 +38,11 @@ func cronNextMillis(pattern, tz string, afterMillis int64) (int64, error) {
 }
 
 // RepeatOptions configures a job scheduler. Exactly one of Every (interval in ms)
-// or Pattern (cron) must be set. Cron patterns are not yet supported by this port
-// (they require a cron-parser-compatible next-time computation for interop).
+// or Pattern (cron) must be set. Cron next-times are computed compatibly with
+// Node's cron-parser, so schedules advance identically across runtimes.
 type RepeatOptions struct {
 	Every       int64  // milliseconds between runs
-	Pattern     string // cron expression (not yet supported)
+	Pattern     string // cron expression (5-field, or 6-field with leading seconds)
 	Limit       int    // max iterations (0 = unlimited)
 	Offset      int64  // ms offset applied to Every
 	StartDate   int64  // ms epoch; do not run before this

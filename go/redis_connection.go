@@ -9,7 +9,7 @@ import (
 
 // connection wires a Redis client (and a dedicated blocking peer) to the registry
 // of embedded Lua scripts. Ported from python/bullmq/redis_connection.py, extended
-// with client injection for DI (see PLAN §4.2).
+// with client injection for DI.
 type connection struct {
 	client         redis.UniversalClient
 	blockingClient redis.UniversalClient
@@ -83,7 +83,7 @@ func loadScriptRegistry() (map[string]*redis.Script, error) {
 
 // LoadScripts pre-loads every script into Redis with SCRIPT LOAD. This is required
 // before running scripts inside a pipeline/MULTI, where the NOSCRIPT fallback is
-// not available (mirrors rust load_all / python register_script). See PLAN §4.9.
+// not available (mirrors rust load_all / python register_script).
 func (c *connection) LoadScripts(ctx context.Context) error {
 	for name, script := range c.scripts {
 		if err := script.Load(ctx, c.client).Err(); err != nil {
@@ -112,7 +112,7 @@ func (c *connection) Close() error {
 
 // duplicate returns a fresh client with the same options as c, mirroring ioredis
 // client.duplicate(). go-redis has no generic Options() on UniversalClient, so we
-// switch on the concrete type. See PLAN §4.2.
+// switch on the concrete type.
 func duplicate(c redis.UniversalClient) (redis.UniversalClient, error) {
 	switch cc := c.(type) {
 	case *redis.Client:
