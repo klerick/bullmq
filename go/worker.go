@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 )
 
 const (
@@ -16,6 +18,12 @@ const (
 	defaultMaxStalledCount       = 1
 	defaultDrainDelay            = 5 * time.Second
 	maxBlockTimeout              = 10 * time.Second
+
+	// minimumBlockTimeout floors how long the worker blocks on the marker, so a
+	// wake-up that is already due still yields to Redis instead of spinning.
+	// python/bullmq/worker.py uses 1ms when the server can block for 1ms (Redis >= 7)
+	// and 2ms otherwise; the fork has no capability probe, so it takes the 1ms value.
+	minimumBlockTimeout = time.Millisecond
 )
 
 // Processor handles a single job. Returning a value completes the job; returning
@@ -202,22 +210,46 @@ func (w *Worker) moveToActive(ctx context.Context, token string) (*Job, error) {
 
 // waitForJob blocks on the marker (BZPOPMIN) using a dedicated client, so a job
 // added by any producer wakes the worker promptly.
+//
+// Below one second the command is built by hand rather than through go-redis's typed
+// BZPopMin: that helper formats the timeout as whole seconds, which rounds a
+// sub-second wait up to 1s and logs a warning for every delayed job. At or above one
+// second the typed helper stays, because it also sets the per-command read timeout
+// (unexported, so the raw path cannot) that a long block needs to keep the socket
+// from timing out first.
 func (w *Worker) waitForJob(ctx context.Context) {
 	timeout := w.blockTimeout()
-	_, _ = w.queue.conn.blockingClient.BZPopMin(ctx, timeout, w.queue.keys.Marker()).Result()
+	marker := w.queue.keys.Marker()
+	if timeout < time.Second {
+		_ = w.queue.conn.blockingClient.Process(ctx, newBZPopMinCmd(ctx, marker, timeout))
+	} else {
+		_, _ = w.queue.conn.blockingClient.BZPopMin(ctx, timeout, marker).Result()
+	}
 	w.blockUntil = 0
 }
 
+// newBZPopMinCmd builds the same command go-redis's BZPopMin builds, but keeps the
+// timeout as fractional seconds, which Redis >= 6 accepts.
+func newBZPopMinCmd(ctx context.Context, marker string, timeout time.Duration) *redis.ZWithKeyCmd {
+	return redis.NewZWithKeyCmd(ctx, "bzpopmin", marker, timeout.Seconds())
+}
+
+// blockTimeout is the time to wait on the marker: until the next delayed job or the
+// end of a rate-limit window when one is pending, the drain delay otherwise, floored
+// at minimumBlockTimeout. Ported from python/bullmq/worker.py::getBlockTimeout.
 func (w *Worker) blockTimeout() time.Duration {
 	if w.blockUntil > 0 {
-		d := w.blockUntil - nowMillis()
-		if d <= 0 {
-			return time.Millisecond
+		d := time.Duration(w.blockUntil-nowMillis()) * time.Millisecond
+		if d > maxBlockTimeout {
+			return maxBlockTimeout
 		}
-		if dur := time.Duration(d) * time.Millisecond; dur < maxBlockTimeout {
-			return dur
+		if d < minimumBlockTimeout {
+			return minimumBlockTimeout
 		}
-		return maxBlockTimeout
+		return d
+	}
+	if w.drainDelay < minimumBlockTimeout {
+		return minimumBlockTimeout
 	}
 	return w.drainDelay
 }
