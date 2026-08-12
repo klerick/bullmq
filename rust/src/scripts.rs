@@ -51,7 +51,7 @@ impl LuaScript {
             Ok(val) => Ok(val),
             Err(e) => {
                 // Check for NOSCRIPT error - fall back to EVAL
-                if e.kind() == redis::ErrorKind::NoScriptError {
+                if e.kind() == redis::ErrorKind::Server(redis::ServerErrorKind::NoScript) {
                     let mut eval_cmd = redis::cmd("EVAL");
                     eval_cmd.arg(self.content.as_str()).arg(self.num_keys);
                     for key in keys {
@@ -188,6 +188,7 @@ impl ScriptRegistry {
             ("getCounts", 1, include_str!("commands/getCounts-1.lua")),
             ("getState", 8, include_str!("commands/getState-8.lua")),
             ("getStateV2", 8, include_str!("commands/getStateV2-8.lua")),
+            ("getJobs", 1, include_str!("commands/getJobs-1.lua")),
             ("getRanges", 1, include_str!("commands/getRanges-1.lua")),
             (
                 "getRateLimitTtl",
@@ -273,11 +274,6 @@ impl ScriptRegistry {
                 include_str!("commands/removeChildDependency-1.lua"),
             ),
             (
-                "removeRepeatable",
-                3,
-                include_str!("commands/removeRepeatable-3.lua"),
-            ),
-            (
                 "removeUnprocessedChildren",
                 2,
                 include_str!("commands/removeUnprocessedChildren-2.lua"),
@@ -286,16 +282,6 @@ impl ScriptRegistry {
                 "removeOrphanedJobs",
                 1,
                 include_str!("commands/removeOrphanedJobs-1.lua"),
-            ),
-            (
-                "addRepeatableJob",
-                2,
-                include_str!("commands/addRepeatableJob-2.lua"),
-            ),
-            (
-                "updateRepeatableJobMillis",
-                1,
-                include_str!("commands/updateRepeatableJobMillis-1.lua"),
             ),
         ]
     }
@@ -311,7 +297,11 @@ impl Default for ScriptRegistry {
 fn compute_sha1(content: &str) -> String {
     let mut hasher = Sha1::new();
     hasher.update(content.as_bytes());
-    format!("{:x}", hasher.finalize())
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 #[cfg(test)]

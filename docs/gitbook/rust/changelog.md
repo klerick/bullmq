@@ -1,3 +1,25 @@
+## [1.2.3](https://github.com/taskforcesh/bullmq/compare/vrs1.2.2...vrs1.2.3) (2026-08-07)
+
+
+### Bug Fixes
+
+* **worker:** resolve worker delay in picking up new jobs [rust] fixes [#4512](https://github.com/taskforcesh/bullmq/issues/4512)  ([#4523](https://github.com/taskforcesh/bullmq/issues/4523)) ([94d3286](https://github.com/taskforcesh/bullmq/commit/94d32867f9b4f439cd1fc57f9f8c3543dd913e42))
+
+## [1.2.2](https://github.com/taskforcesh/bullmq/compare/vrs1.2.1...vrs1.2.2) (2026-08-01)
+
+
+### Bug Fixes
+
+* **deps:** update security patches [security] [rust] ([#4404](https://github.com/taskforcesh/bullmq/issues/4404)) ([956e2d4](https://github.com/taskforcesh/bullmq/commit/956e2d4b1cefd5b1e4da98d69013a2fa866e8d75))
+
+# [1.2.1](https://github.com/taskforcesh/bullmq/compare/vrs1.2.0...vrs1.2.1) (2026-07-30)
+
+
+### Bug Fixes
+
+* **deps:** pin dependencies [rust] ([#4402](https://github.com/taskforcesh/bullmq/issues/4402)) ([eb956b0](https://github.com/taskforcesh/bullmq/commit/eb956b07fde2ab3d43b41325a06a6b103610e3e3))
+* **deps:** update dependency redis [security] ([#4369](https://github.com/taskforcesh/bullmq/issues/4369)) ([2a120df](https://github.com/taskforcesh/bullmq/commit/2a120dfea7324d7af67ad505c78f48571c74402b))
+
 # [1.1.0](https://github.com/taskforcesh/bullmq/compare/vrs1.0.1...vrs1.1.0) (2026-07-15)
 
 

@@ -1,20 +1,19 @@
-## [1.0.2](https://github.com/taskforcesh/bullmq/compare/vphp1.0.1...vphp1.0.2) (2026-04-03)
-
-
-### Features
-
-* **deduplication:** add keepLastIfActive option for at-least-once-after-active semantics ([#3902](https://github.com/taskforcesh/bullmq/issues/3902)) ([aa529bc](https://github.com/taskforcesh/bullmq/commit/aa529bc512b15cdb9d173cc9cc3b0d9f8b8959eb))
-
-## [1.0.1](https://github.com/taskforcesh/bullmq/compare/vphp1.0.0...vphp1.0.1) (2025-12-19)
+## [2.0.1](https://github.com/taskforcesh/bullmq/compare/vphp2.0.0...vphp2.0.1) (2026-08-05)
 
 
 ### Bug Fixes
 
-* **release:** correct php release condition check [php] ([#3617](https://github.com/taskforcesh/bullmq/issues/3617)) ([7ac421c](https://github.com/taskforcesh/bullmq/commit/7ac421cb2e754ba262a18bb17d47f15fb22a6962))
+* **deps:** upgrade predis to v3 (major) [php] (major) ([#4489](https://github.com/taskforcesh/bullmq/issues/4489)) ([6a166ea](https://github.com/taskforcesh/bullmq/commit/6a166ea3f747f5dece935d206057d43c2febcde7))
 
-# 0.1.0 (2025-12-09)
+# [2.0.0](https://github.com/taskforcesh/bullmq/compare/vphp1.0.3...vphp2.0.0) (2026-07-30)
 
 
 ### Features
 
-* initial php package ([d365bb3](https://github.com/taskforcesh/bullmq/commit/d365bb3f31193afc3c89c54a0d78aaac2abd2cbf))
+* release BullMQ v2 with pluggable queue backends (php) (python) (elixir) ([e1f86ef](https://github.com/taskforcesh/bullmq/commit/e1f86effc5bddda5b70d890866d9a490555e41ff))
+
+### BREAKING CHANGES
+
+* The deprecated debounce option and Job#debounceId property are removed. Use deduplication and Job#deduplicationId instead.
+* The deprecated debounced event is removed. Listen for the deduplicated event instead.
+* The paused job state is removed from JobType and from the default Queue#getJobCounts() result. Jobs in a paused queue are represented as waiting.

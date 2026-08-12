@@ -20,16 +20,17 @@ jobs:
     outputs:
       should_run: ${{ steps.filter.outputs.python }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         id: filter
         with:
           filters: |
             python:
               - 'python/**'
               - 'src/commands/**'
+              - 'src/postgres/**'
               - 'scripts/**'
               - 'package.json'
               - 'yarn.lock'
@@ -56,11 +57,11 @@ jobs:
         run: echo "No python changes detected; skipping steps."
       - name: Checkout repository
         if: env.should_run == 'true'
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Use Node.js ${{ matrix.node-version }}
         if: env.should_run == 'true'
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ matrix.node-version }}
           cache: 'yarn'
@@ -74,11 +75,13 @@ jobs:
       - if: env.should_run == 'true'
         run: yarn build
       - if: env.should_run == 'true'
-        run: yarn copy:lua:python
+        run: |
+          yarn copy:lua:python
+          yarn copy:sql:python
 
       - name: Set up Python ${{ matrix.python-version }}
         if: env.should_run == 'true'
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -131,11 +134,11 @@ jobs:
         run: echo "No python changes detected; skipping steps."
       - name: Checkout repository
         if: env.should_run == 'true'
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Use Node.js ${{ matrix.node-version }}
         if: env.should_run == 'true'
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ matrix.node-version }}
           cache: 'yarn'
@@ -144,11 +147,13 @@ jobs:
       - if: env.should_run == 'true'
         run: yarn build
       - if: env.should_run == 'true'
-        run: yarn copy:lua:python
+        run: |
+          yarn copy:lua:python
+          yarn copy:sql:python
 
       - name: Set up Python ${{ matrix.python-version }}
         if: env.should_run == 'true'
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python-version }}
 

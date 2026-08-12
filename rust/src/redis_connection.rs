@@ -1,5 +1,5 @@
 use redis::aio::MultiplexedConnection;
-use redis::Client;
+use redis::{AsyncConnectionConfig, Client, ClientTlsConfig, TlsCertificates};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::debug;
@@ -7,6 +7,38 @@ use tracing::debug;
 use crate::error::Error;
 use crate::options::{redact_url_userinfo, RedisConnectionOptions};
 use crate::scripts::ScriptRegistry;
+
+/// Build a Redis [`Client`] from connection options.
+///
+/// When [`RedisConnectionOptions::tls_certs`] is set, the client is built with
+/// the supplied TLS certificates (custom root CA and/or client certificate for
+/// mTLS); otherwise the client is opened directly from the URL scheme.
+fn build_client(opts: &RedisConnectionOptions, url: &str) -> Result<Client, Error> {
+    let Some(certs) = &opts.tls_certs else {
+        return Ok(Client::open(url)?);
+    };
+
+    let client_tls = match (&certs.client_cert, &certs.client_key) {
+        (Some(client_cert), Some(client_key)) => Some(ClientTlsConfig {
+            client_cert: client_cert.clone(),
+            client_key: client_key.clone(),
+        }),
+        (None, None) => None,
+        _ => {
+            return Err(Error::InvalidConfig(
+                "tls_certs requires both client_cert and client_key for mutual TLS (mTLS)"
+                    .to_string(),
+            ))
+        }
+    };
+
+    let tls_certs = TlsCertificates {
+        client_tls,
+        root_cert: certs.root_cert.clone(),
+    };
+
+    Ok(Client::build_with_tls(url, tls_certs)?)
+}
 
 /// A managed Redis connection that handles reconnection and script loading.
 ///
@@ -28,7 +60,7 @@ impl RedisConnection {
     /// Create a new connection from options.
     pub async fn new(opts: &RedisConnectionOptions) -> Result<Self, Error> {
         let url = opts.effective_url();
-        let client = Client::open(url.as_str())?;
+        let client = build_client(opts, &url)?;
         let scripts = ScriptRegistry::new();
         let mut conn = client.get_multiplexed_async_connection().await?;
         scripts.load_all(&mut conn).await?;
@@ -106,8 +138,27 @@ struct BlockingInner {
 
 impl BlockingRedisConnection {
     /// Create a new blocking connection from a client.
+    ///
+    /// The connection is created with its response timeout **disabled**.
+    /// redis-rs applies a 500ms default response timeout to every multiplexed
+    /// connection. This connection is dedicated to blocking reads (`BZPOPMIN`
+    /// on the marker key) that must wait up to `drain_delay` seconds for a job
+    /// to appear. With the default timeout, the client abandons the in-flight
+    /// `BZPOPMIN` after 500ms — long before a marker is written for an idle
+    /// worker. When the marker eventually arrives, the server-side `BZPOPMIN`
+    /// pops it and replies, but the client has already discarded that request
+    /// slot, so the marker is silently consumed without waking the worker. The
+    /// worker then only picks up the job on its periodic empty-queue re-poll,
+    /// yielding 0–`drain_delay`s pickup latency (see issue #4512). Disabling
+    /// the response timeout lets the command block for its full duration so the
+    /// reply is always delivered to a live waiter. This mirrors the TypeScript
+    /// worker, whose stuck-connection watchdog fires at `blockTimeout + 1s`,
+    /// deliberately longer than the block rather than shorter.
     pub async fn new(client: &Client) -> Result<Self, Error> {
-        let conn = client.get_multiplexed_async_connection().await?;
+        let config = AsyncConnectionConfig::new().set_response_timeout(None);
+        let conn = client
+            .get_multiplexed_async_connection_with_config(&config)
+            .await?;
         Ok(Self {
             inner: Arc::new(BlockingInner {
                 conn: Mutex::new(conn),
@@ -153,7 +204,57 @@ impl BlockingRedisConnection {
 
 #[cfg(test)]
 mod tests {
-    use crate::options::redact_url_userinfo;
+    use super::build_client;
+    use crate::error::Error;
+    use crate::options::{redact_url_userinfo, RedisConnectionOptions, TlsCerts};
+
+    fn opts_with_certs(certs: TlsCerts) -> RedisConnectionOptions {
+        RedisConnectionOptions {
+            tls_certs: Some(certs),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn build_client_without_tls_certs_succeeds() {
+        let opts = RedisConnectionOptions::default();
+        assert!(build_client(&opts, "redis://127.0.0.1:6379").is_ok());
+    }
+
+    #[test]
+    fn build_client_with_root_cert_only_succeeds() {
+        let opts = opts_with_certs(TlsCerts {
+            root_cert: Some(b"cert".to_vec()),
+            ..Default::default()
+        });
+        assert!(build_client(&opts, "rediss://127.0.0.1:6379").is_ok());
+    }
+
+    #[test]
+    fn build_client_with_client_cert_without_key_errors() {
+        let opts = opts_with_certs(TlsCerts {
+            client_cert: Some(b"cert".to_vec()),
+            client_key: None,
+            ..Default::default()
+        });
+        assert!(matches!(
+            build_client(&opts, "rediss://127.0.0.1:6379"),
+            Err(Error::InvalidConfig(_))
+        ));
+    }
+
+    #[test]
+    fn build_client_with_client_key_without_cert_errors() {
+        let opts = opts_with_certs(TlsCerts {
+            client_cert: None,
+            client_key: Some(b"key".to_vec()),
+            ..Default::default()
+        });
+        assert!(matches!(
+            build_client(&opts, "rediss://127.0.0.1:6379"),
+            Err(Error::InvalidConfig(_))
+        ));
+    }
 
     #[test]
     fn redacts_username_password() {

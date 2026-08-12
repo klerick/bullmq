@@ -9,14 +9,14 @@ description: BullMQ is available as a native Rust crate with full async/await su
 Add BullMQ to your project via Cargo:
 
 ```bash
-cargo add bullmq-official
+cargo add bullmq-official --rename bullmq
 ```
 
 Or add it to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-bullmq-official = "0.1"
+bullmq = { version = "1.2", package = "bullmq-official" }
 ```
 
 > The crate is published as `bullmq-official` (the `bullmq`, `bullmq-rust` and
@@ -205,6 +205,31 @@ let conn = RedisConnectionOptions {
     password: Some("password".to_string()),
     db: Some(0),
     tls: true,
+    ..Default::default()
+};
+```
+
+### Custom TLS certificates
+
+To connect over TLS with a custom root CA (for example a self-signed
+certificate) or a client certificate and key for mutual TLS (mTLS), provide a
+`tls_certs` value. All certificates and keys must be in PEM format. Setting
+`tls_certs` implies a TLS (`rediss://`) connection, so `tls: true` is not
+required:
+
+```rust
+use bullmq::options::{RedisConnectionOptions, TlsCerts};
+
+let conn = RedisConnectionOptions {
+    host: Some("redis.example.com".to_string()),
+    port: Some(6380),
+    tls_certs: Some(TlsCerts {
+        // Custom CA certificate (omit to use the default WebPKI root store).
+        root_cert: Some(std::fs::read("ca.pem")?),
+        // Client certificate and key for mutual TLS (mTLS).
+        client_cert: Some(std::fs::read("client-cert.pem")?),
+        client_key: Some(std::fs::read("client-key.pem")?),
+    }),
     ..Default::default()
 };
 ```

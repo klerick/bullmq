@@ -563,7 +563,7 @@ async fn test_add_job_lifo() {
     }
 
     let counts = queue.get_job_counts().await.unwrap();
-    assert_eq!(counts.paused, 4);
+    assert_eq!(counts.waiting, 4);
 
     cleanup_queue(&queue).await;
 }
@@ -869,6 +869,46 @@ async fn test_get_jobs_by_type_waiting() {
     // Default (empty types) returns everything too.
     let all = queue.get_jobs(&[], 0, -1, true).await.unwrap();
     assert_eq!(all.len(), 5);
+
+    cleanup_queue(&queue).await;
+}
+
+#[tokio::test]
+async fn test_get_jobs_skips_missing_hash_and_preserves_waiting_order() {
+    let name = test_queue_name();
+    let queue = Queue::with_options(
+        &name,
+        QueueOptions {
+            connection: test_connection(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let first = queue
+        .add("first", serde_json::json!({"idx": 1}))
+        .await
+        .unwrap();
+    let missing = queue
+        .add("missing", serde_json::json!({"idx": 2}))
+        .await
+        .unwrap();
+    let third = queue
+        .add("third", serde_json::json!({"idx": 3}))
+        .await
+        .unwrap();
+
+    let mut conn = queue.connection().conn();
+    redis::cmd("DEL")
+        .arg(queue.keys().job_key(missing.id()))
+        .query_async::<()>(&mut conn)
+        .await
+        .unwrap();
+
+    let jobs = queue.get_jobs(&["waiting"], 0, 1, true).await.unwrap();
+    let ids: Vec<&str> = jobs.iter().map(|job| job.id()).collect();
+    assert_eq!(ids, vec![first.id(), third.id()]);
 
     cleanup_queue(&queue).await;
 }

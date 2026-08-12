@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bullmq"
-version = "2.25.3"
+version = "3.0.4"
 description='BullMQ for Python'
 readme="README.md"
 authors = [
@@ -20,23 +20,27 @@ classifiers=[
 ]
 keywords = ["python", "bullmq", "queues"]
 dependencies = [
-    "redis ==7.4.0",
+    "redis ==7.4.1",
     "msgpack ==1.2.1",
-    "semver ==3.0.4"
+    "semver ==3.0.4",
+    "croniter ==2.0.7"
 ]
 
 [project.optional-dependencies]
 dev = [
-    "pre-commit==4.5.1",
-    "build==1.4.2",
+    "pre-commit==4.6.2",
+    "build==1.5.0",
     "types-redis==4.6.0.20241004",
-    "pipenv==2026.5.1",
-    "virtualenv==21.2.0",
+    "pipenv==2026.7.1",
+    "virtualenv==21.7.4",
     "virtualenv-clone==0.5.7"
 ]
 test = [
-    "pytest==9.0.3",
+    "pytest==9.1.1",
     "pytest-timeout==2.4.0"
+]
+postgres = [
+    "psycopg[binary] ==3.3.4"
 ]
 
 [project.urls]
@@ -47,4 +51,4 @@ test = [
 exclude = ["tests*"]
 
 [tool.setuptools.package-data]
-bullmq = ["commands/*.lua", "types/*"]
+bullmq = ["commands/*.lua", "types/*", "postgres/commands/*.sql", "postgres/migrations/*.sql"]
