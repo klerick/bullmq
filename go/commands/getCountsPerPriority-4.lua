@@ -12,22 +12,10 @@ local results = {}
 local waitKey = KEYS[1]
 local pausedKey = KEYS[2]
 local prioritizedKey = KEYS[4]
--- Includes
---[[
-  Function to check for the meta.paused key to decide if we are paused or not
-  (since an empty list and !EXISTS are not really the same).
-]]
-local function isQueuePaused(queueMetaKey)
-  return rcall("HEXISTS", queueMetaKey, "paused") == 1
-end
 for i = 1, #ARGV do
   local priority = tonumber(ARGV[i])
   if priority == 0 then
-    if isQueuePaused(KEYS[3]) then
-      results[#results+1] = rcall("LLEN", pausedKey)
-    else
-      results[#results+1] = rcall("LLEN", waitKey)
-    end
+    results[#results+1] = rcall("LLEN", waitKey)
   else
     results[#results+1] = rcall("ZCOUNT", prioritizedKey,
       priority * 0x100000000, (priority + 1)  * 0x100000000 - 1)

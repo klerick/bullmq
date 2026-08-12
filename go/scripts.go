@@ -600,7 +600,12 @@ func boolArg(b bool) string {
 
 // pause moves wait->paused (pause=true) or paused->wait (resume) and flips the
 // meta "paused" flag. From pause-7.lua.
-func (s *scripts) pause(ctx context.Context, pause bool) error {
+// pause flips the queue's paused meta flag. Resuming also migrates any jobs a
+// pre-v6 runtime left in the legacy paused list back into wait, in batches; the
+// script returns how many are still there, so the caller loops until it is 0.
+// emitEvent is false on the follow-up calls of such a loop, so the resumed event
+// is published once.
+func (s *scripts) pause(ctx context.Context, pause, emitEvent bool) (int64, error) {
 	src, dst, arg := "wait", "paused", "paused"
 	if !pause {
 		src, dst, arg = "paused", "wait", "resumed"
@@ -609,7 +614,16 @@ func (s *scripts) pause(ctx context.Context, pause bool) error {
 		s.keys.Get(src), s.keys.Get(dst), s.keys.Meta(), s.keys.Prioritized(),
 		s.keys.Events(), s.keys.Delayed(), s.keys.Marker(),
 	}
-	return s.runVoid(ctx, "pause", keys, arg)
+	emit := "1"
+	if !emitEvent {
+		emit = "0"
+	}
+	res, err := s.run(ctx, "pause", keys, arg, emit)
+	if err != nil {
+		return 0, err
+	}
+	remaining, _ := res.(int64)
+	return remaining, nil
 }
 
 // drain removes waiting/prioritized (and optionally delayed) jobs. From drain-5.lua.

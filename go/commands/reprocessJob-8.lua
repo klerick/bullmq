@@ -50,24 +50,20 @@ local function getOrSetMaxEvents(metaKey)
   return maxEvents
 end
 --[[
-  Function to check for the meta.paused key to decide if we are paused or not
+  Function to check if queue is paused or maxed
   (since an empty list and !EXISTS are not really the same).
 ]]
-local function getTargetQueueList(queueMetaKey, activeKey, waitKey, pausedKey)
-  local queueAttributes = rcall("HMGET", queueMetaKey, "paused", "concurrency", "max", "duration")
+local function isQueuePausedOrMaxed(queueMetaKey, activeKey)
+  local queueAttributes = rcall("HMGET", queueMetaKey, "paused", "concurrency")
   if queueAttributes[1] then
-    return pausedKey, true, queueAttributes[3], queueAttributes[4]
+    return true
   else
     if queueAttributes[2] then
       local activeCount = rcall("LLEN", activeKey)
-      if activeCount >= tonumber(queueAttributes[2]) then
-        return waitKey, true, queueAttributes[3], queueAttributes[4]
-      else
-        return waitKey, false, queueAttributes[3], queueAttributes[4]
-      end
+      return activeCount >= tonumber(queueAttributes[2])
     end
   end
-  return waitKey, false, queueAttributes[3], queueAttributes[4]
+  return false
 end
 local jobKey = KEYS[1]
 if rcall("EXISTS", jobKey) == 1 then
@@ -81,8 +77,8 @@ if rcall("EXISTS", jobKey) == 1 then
       table.insert(attributesToRemove, "ats")
     end
     rcall("HDEL", jobKey, "finishedOn", "processedOn", ARGV[3], unpack(attributesToRemove))
-    local target, isPausedOrMaxed = getTargetQueueList(KEYS[5], KEYS[7], KEYS[4], KEYS[6])
-    addJobInTargetList(target, KEYS[8], ARGV[2], isPausedOrMaxed, jobId)
+    local isPausedOrMaxed = isQueuePausedOrMaxed(KEYS[5], KEYS[7])
+    addJobInTargetList(KEYS[4], KEYS[8], ARGV[2], isPausedOrMaxed, jobId)
     local parentKey = rcall("HGET", jobKey, "parentKey")
     if parentKey and rcall("EXISTS", parentKey) == 1 then
       if ARGV[4] == "failed" then

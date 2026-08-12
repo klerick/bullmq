@@ -38,6 +38,9 @@
         jobId  - OK
         -5     - Missing parent key
 ]]
+local waitKey = KEYS[1]
+local metaKey = KEYS[3]
+local activeKey = KEYS[7]
 local eventsKey = KEYS[8]
 local jobId
 local jobIdKey
@@ -103,13 +106,13 @@ local function checkItemInList(list, item)
   end
   return nil
 end
-local function storeDeduplicatedNextJob(deduplicationOpts, currentDebounceJobId, prefix,
+local function storeDeduplicatedNextJob(deduplicationOpts, currentDeduplicatedJobId, prefix,
     deduplicationId, jobName, jobData, fullOpts, eventsKey, maxEvents, jobId,
     parentKey, parentData, parentDependenciesKey, repeatJobKey)
-    if deduplicationOpts['keepLastIfActive'] and currentDebounceJobId then
+    if deduplicationOpts['keepLastIfActive'] and currentDeduplicatedJobId then
         local activeKey = prefix .. "active"
         local activeItems = rcall('LRANGE', activeKey, 0, -1)
-        if checkItemInList(activeItems, currentDebounceJobId) then
+        if checkItemInList(activeItems, currentDeduplicatedJobId) then
             local deduplicationNextKey = prefix .. "dn:" .. deduplicationId
             local fields = {'name', jobName, 'data', jobData, 'opts', cjson.encode(fullOpts),
                 'jid', jobId}
@@ -136,11 +139,8 @@ local function storeDeduplicatedNextJob(deduplicationOpts, currentDebounceJobId,
             -- the active-check because of a TTL expiry.
             local deduplicationKey = prefix .. "de:" .. deduplicationId
             rcall('PERSIST', deduplicationKey)
-            -- TODO remove debounced event in next breaking change
-            rcall("XADD", eventsKey, "MAXLEN", "~", maxEvents, "*", "event", "debounced", "jobId",
-                currentDebounceJobId, "debounceId", deduplicationId)
             rcall("XADD", eventsKey, "MAXLEN", "~", maxEvents, "*", "event", "deduplicated", "jobId",
-                currentDebounceJobId, "deduplicationId", deduplicationId, "deduplicatedJobId", jobId)
+                currentDeduplicatedJobId, "deduplicationId", deduplicationId, "deduplicatedJobId", jobId)
             return true
         end
     end
@@ -153,23 +153,21 @@ local function deduplicateJobWithoutReplace(deduplicationId, deduplicationOpts, 
     local deduplicationKeyExists
     if ttl and ttl > 0 then
         if deduplicationOpts['extend'] then
-            local currentDebounceJobId = rcall('GET', deduplicationKey)
-            if currentDebounceJobId then
-                if storeDeduplicatedNextJob(deduplicationOpts, currentDebounceJobId, prefix,
+            local currentDeduplicatedJobId = rcall('GET', deduplicationKey)
+            if currentDeduplicatedJobId then
+                if storeDeduplicatedNextJob(deduplicationOpts, currentDeduplicatedJobId, prefix,
                     deduplicationId, jobName, jobData, fullOpts, eventsKey, maxEvents, jobId,
                     parentKey, parentData, parentDependenciesKey, repeatJobKey) then
-                    return currentDebounceJobId
+                    return currentDeduplicatedJobId
                 end
                 if deduplicationOpts['keepLastIfActive'] then
-                    rcall('SET', deduplicationKey, currentDebounceJobId)
+                    rcall('SET', deduplicationKey, currentDeduplicatedJobId)
                 else
-                    setDeduplicationKey(deduplicationKey, currentDebounceJobId, deduplicationOpts)
+                    setDeduplicationKey(deduplicationKey, currentDeduplicatedJobId, deduplicationOpts)
                 end
-                rcall("XADD", eventsKey, "MAXLEN", "~", maxEvents, "*", "event", "debounced",
-                    "jobId", currentDebounceJobId, "debounceId", deduplicationId)
                 rcall("XADD", eventsKey, "MAXLEN", "~", maxEvents, "*", "event", "deduplicated", "jobId",
-                    currentDebounceJobId, "deduplicationId", deduplicationId, "deduplicatedJobId", jobId)
-                return currentDebounceJobId
+                    currentDeduplicatedJobId, "deduplicationId", deduplicationId, "deduplicatedJobId", jobId)
+                return currentDeduplicatedJobId
             else
                 if deduplicationOpts['keepLastIfActive'] then
                     rcall('SET', deduplicationKey, jobId)
@@ -189,18 +187,15 @@ local function deduplicateJobWithoutReplace(deduplicationId, deduplicationOpts, 
         deduplicationKeyExists = not rcall('SET', deduplicationKey, jobId, 'NX')
     end
     if deduplicationKeyExists then
-        local currentDebounceJobId = rcall('GET', deduplicationKey)
-        if storeDeduplicatedNextJob(deduplicationOpts, currentDebounceJobId, prefix,
+        local currentDeduplicatedJobId = rcall('GET', deduplicationKey)
+        if storeDeduplicatedNextJob(deduplicationOpts, currentDeduplicatedJobId, prefix,
             deduplicationId, jobName, jobData, fullOpts, eventsKey, maxEvents, jobId,
             parentKey, parentData, parentDependenciesKey, repeatJobKey) then
-            return currentDebounceJobId
+            return currentDeduplicatedJobId
         end
-        -- TODO remove debounced event in next breaking change
-        rcall("XADD", eventsKey, "MAXLEN", "~", maxEvents, "*", "event", "debounced", "jobId",
-            currentDebounceJobId, "debounceId", deduplicationId)
         rcall("XADD", eventsKey, "MAXLEN", "~", maxEvents, "*", "event", "deduplicated", "jobId",
-            currentDebounceJobId, "deduplicationId", deduplicationId, "deduplicatedJobId", jobId)
-        return currentDebounceJobId
+            currentDeduplicatedJobId, "deduplicationId", deduplicationId, "deduplicatedJobId", jobId)
+        return currentDeduplicatedJobId
     end
 end
 --[[
@@ -216,9 +211,6 @@ local function removeDelayedJob(delayedKey, deduplicationKey, eventsKey, maxEven
         removeJobKeys(prefix .. currentDeduplicatedJobId)
         rcall("XADD", eventsKey, "*", "event", "removed", "jobId", currentDeduplicatedJobId,
             "prev", "delayed")
-        -- TODO remove debounced event in next breaking change
-        rcall("XADD", eventsKey, "MAXLEN", "~", maxEvents, "*", "event", "debounced", "jobId",
-            jobId, "debounceId", deduplicationId)
         rcall("XADD", eventsKey, "MAXLEN", "~", maxEvents, "*", "event", "deduplicated", "jobId",
             jobId, "deduplicationId", deduplicationId, "deduplicatedJobId", currentDeduplicatedJobId)
         return true
@@ -230,10 +222,10 @@ local function deduplicateJob(deduplicationOpts, jobId, delayedKey, deduplicatio
     local deduplicationId = deduplicationOpts and deduplicationOpts['id']
     if deduplicationId then
         if deduplicationOpts['replace'] then
-            local currentDebounceJobId = rcall('GET', deduplicationKey)
-            if currentDebounceJobId then
+            local currentDeduplicatedJobId = rcall('GET', deduplicationKey)
+            if currentDeduplicatedJobId then
                 local isRemoved = removeDelayedJob(delayedKey, deduplicationKey, eventsKey, maxEvents,
-                    currentDebounceJobId, jobId, deduplicationId, prefix)
+                    currentDeduplicatedJobId, jobId, deduplicationId, prefix)
                 if isRemoved then
                     if deduplicationOpts['keepLastIfActive'] then
                         rcall('SET', deduplicationKey, jobId)
@@ -247,10 +239,10 @@ local function deduplicateJob(deduplicationOpts, jobId, delayedKey, deduplicatio
                     end
                     return
                 else
-                    storeDeduplicatedNextJob(deduplicationOpts, currentDebounceJobId, prefix,
+                    storeDeduplicatedNextJob(deduplicationOpts, currentDeduplicatedJobId, prefix,
                         deduplicationId, jobName, jobData, fullOpts, eventsKey, maxEvents, jobId,
                         parentKey, parentData, parentDependenciesKey, repeatJobKey)
-                    return currentDebounceJobId
+                    return currentDeduplicatedJobId
                 end
             else
                 if deduplicationOpts['keepLastIfActive'] then
@@ -277,26 +269,6 @@ local function getOrSetMaxEvents(metaKey)
     rcall("HSET", metaKey, "opts.maxLenEvents", maxEvents)
   end
   return maxEvents
-end
---[[
-  Function to check for the meta.paused key to decide if we are paused or not
-  (since an empty list and !EXISTS are not really the same).
-]]
-local function getTargetQueueList(queueMetaKey, activeKey, waitKey, pausedKey)
-  local queueAttributes = rcall("HMGET", queueMetaKey, "paused", "concurrency", "max", "duration")
-  if queueAttributes[1] then
-    return pausedKey, true, queueAttributes[3], queueAttributes[4]
-  else
-    if queueAttributes[2] then
-      local activeCount = rcall("LLEN", activeKey)
-      if activeCount >= tonumber(queueAttributes[2]) then
-        return waitKey, true, queueAttributes[3], queueAttributes[4]
-      else
-        return waitKey, false, queueAttributes[3], queueAttributes[4]
-      end
-    end
-  end
-  return waitKey, false, queueAttributes[3], queueAttributes[4]
 end
 --[[
   Function to handle the case when job is duplicated.
@@ -385,7 +357,6 @@ local function isQueuePausedOrMaxed(queueMetaKey, activeKey)
 end
 local function moveParentToWait(parentQueueKey, parentKey, parentId, timestamp)
     local parentWaitKey = parentQueueKey .. ":wait"
-    local parentPausedKey = parentQueueKey .. ":paused"
     local parentActiveKey = parentQueueKey .. ":active"
     local parentMetaKey = parentQueueKey .. ":meta"
     local parentMarkerKey = parentQueueKey .. ":marker"
@@ -402,9 +373,9 @@ local function moveParentToWait(parentQueueKey, parentKey, parentId, timestamp)
         addDelayMarkerIfNeeded(parentMarkerKey, parentDelayedKey)
     else
         if priority == 0 then
-            local parentTarget, isParentPausedOrMaxed = getTargetQueueList(parentMetaKey, parentActiveKey,
-                parentWaitKey, parentPausedKey)
-            addJobInTargetList(parentTarget, parentMarkerKey, "RPUSH", isParentPausedOrMaxed, parentId)
+            local isParentPausedOrMaxed =
+                isQueuePausedOrMaxed(parentMetaKey, parentActiveKey)
+            addJobInTargetList(parentWaitKey, parentMarkerKey, "RPUSH", isParentPausedOrMaxed, parentId)
         else
             local isPausedOrMaxed = isQueuePausedOrMaxed(parentMetaKey, parentActiveKey)
             addJobWithPriority(parentMarkerKey, parentQueueKey .. ":prioritized", priority, parentId,
@@ -505,7 +476,6 @@ if parentKey ~= nil then
     parentData = cjson.encode(parent)
 end
 local jobCounter = rcall("INCR", KEYS[4])
-local metaKey = KEYS[3]
 local maxEvents = getOrSetMaxEvents(metaKey)
 local parentDependenciesKey = args[6]
 local timestamp = args[4]
@@ -529,11 +499,11 @@ if deduplicationJobId then
 end
 -- Store the job.
 storeJob(eventsKey, jobIdKey, jobId, args[3], ARGV[2], opts, timestamp,
-         parentKey, parentData, repeatJobKey)
-local target, isPausedOrMaxed = getTargetQueueList(metaKey, KEYS[7], KEYS[1], KEYS[2])
+        parentKey, parentData, repeatJobKey)
+local isPausedOrMaxed = isQueuePausedOrMaxed(metaKey, activeKey)
 -- LIFO or FIFO
 local pushCmd = opts['lifo'] and 'RPUSH' or 'LPUSH'
-addJobInTargetList(target, KEYS[9], pushCmd, isPausedOrMaxed, jobId)
+addJobInTargetList(waitKey, KEYS[9], pushCmd, isPausedOrMaxed, jobId)
 -- Emit waiting event
 rcall("XADD", eventsKey, "MAXLEN", "~", maxEvents, "*", "event", "waiting",
       "jobId", jobId)

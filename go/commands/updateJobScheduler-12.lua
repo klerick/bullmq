@@ -145,24 +145,20 @@ local function addJobWithPriority(markerKey, prioritizedKey, priority, jobId, pr
   addBaseMarkerIfNeeded(markerKey, isPausedOrMaxed)
 end
 --[[
-  Function to check for the meta.paused key to decide if we are paused or not
+  Function to check if queue is paused or maxed
   (since an empty list and !EXISTS are not really the same).
 ]]
-local function getTargetQueueList(queueMetaKey, activeKey, waitKey, pausedKey)
-  local queueAttributes = rcall("HMGET", queueMetaKey, "paused", "concurrency", "max", "duration")
+local function isQueuePausedOrMaxed(queueMetaKey, activeKey)
+  local queueAttributes = rcall("HMGET", queueMetaKey, "paused", "concurrency")
   if queueAttributes[1] then
-    return pausedKey, true, queueAttributes[3], queueAttributes[4]
+    return true
   else
     if queueAttributes[2] then
       local activeCount = rcall("LLEN", activeKey)
-      if activeCount >= tonumber(queueAttributes[2]) then
-        return waitKey, true, queueAttributes[3], queueAttributes[4]
-      else
-        return waitKey, false, queueAttributes[3], queueAttributes[4]
-      end
+      return activeCount >= tonumber(queueAttributes[2])
     end
   end
-  return waitKey, false, queueAttributes[3], queueAttributes[4]
+  return false
 end
 --[[
   Function to store a job
@@ -203,13 +199,13 @@ local function storeAndEnqueueJob(eventsKey, jobIdKey, jobId, name, data, opts,
   if delay ~= 0 and delayedKey then
     addDelayedJob(jobId, delayedKey, eventsKey, timestamp, maxEvents, markerKey, delay)
   else
-    local target, isPausedOrMaxed = getTargetQueueList(metaKey, activeKey, waitKey, pausedKey)
+    local isPausedOrMaxed = isQueuePausedOrMaxed(metaKey, activeKey)
     if priority > 0 then
       addJobWithPriority(markerKey, prioritizedKey, priority, jobId,
           priorityCounterKey, isPausedOrMaxed)
     else
       local pushCmd = opts['lifo'] and 'RPUSH' or 'LPUSH'
-      addJobInTargetList(target, markerKey, pushCmd, isPausedOrMaxed, jobId)
+      addJobInTargetList(waitKey, markerKey, pushCmd, isPausedOrMaxed, jobId)
     end
     rcall("XADD", eventsKey, "MAXLEN", "~", maxEvents, "*", "event", "waiting",
         "jobId", jobId)
@@ -315,12 +311,7 @@ if prevMillis then
             rcall("ZADD", repeatKey, nextMillis, jobSchedulerId)
             rcall("HINCRBY", schedulerKey, "ic", 1)
             rcall("INCR", KEYS[8])
-            -- TODO: remove this workaround in next breaking change,
-            -- all job-schedulers must save job data
-            local templateData = schedulerAttributes[2] or ARGV[3]
-            if templateData and templateData ~= '{}' then
-                rcall("HSET", schedulerKey, "data", templateData)
-            end
+            local templateData = schedulerAttributes[2]
             local delay = nextMillis - now
             -- Fast Clamp delay to minimum of 0
             if delay < 0 then
@@ -330,10 +321,6 @@ if prevMillis then
             addJobFromScheduler(nextDelayedJobKey, nextDelayedJobId, jobOpts, waitKey, pausedKey, KEYS[12], metaKey,
                 prioritizedKey, KEYS[10], delayedKey, KEYS[7], eventsKey, schedulerAttributes[1], maxEvents, ARGV[5],
                 templateData or '{}', jobSchedulerId, delay)
-            -- TODO: remove this workaround in next breaking change
-            if KEYS[11] ~= "" then
-                rcall("HSET", KEYS[11], "nrjid", nextDelayedJobId)
-            end
             return nextDelayedJobId .. "" -- convert to string
         else
             rcall("XADD", eventsKey, "MAXLEN", "~", maxEvents, "*", "event", "duplicated", "jobId", nextDelayedJobId)

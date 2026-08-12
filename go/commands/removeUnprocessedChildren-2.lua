@@ -133,29 +133,25 @@ local function addJobInTargetList(targetKey, markerKey, pushCmd, isPausedOrMaxed
   addBaseMarkerIfNeeded(markerKey, isPausedOrMaxed)
 end
 --[[
-  Function to check for the meta.paused key to decide if we are paused or not
+  Function to check if queue is paused or maxed
   (since an empty list and !EXISTS are not really the same).
 ]]
-local function getTargetQueueList(queueMetaKey, activeKey, waitKey, pausedKey)
-  local queueAttributes = rcall("HMGET", queueMetaKey, "paused", "concurrency", "max", "duration")
+local function isQueuePausedOrMaxed(queueMetaKey, activeKey)
+  local queueAttributes = rcall("HMGET", queueMetaKey, "paused", "concurrency")
   if queueAttributes[1] then
-    return pausedKey, true, queueAttributes[3], queueAttributes[4]
+    return true
   else
     if queueAttributes[2] then
       local activeCount = rcall("LLEN", activeKey)
-      if activeCount >= tonumber(queueAttributes[2]) then
-        return waitKey, true, queueAttributes[3], queueAttributes[4]
-      else
-        return waitKey, false, queueAttributes[3], queueAttributes[4]
-      end
+      return activeCount >= tonumber(queueAttributes[2])
     end
   end
-  return waitKey, false, queueAttributes[3], queueAttributes[4]
+  return false
 end
 local function _moveParentToWait(parentPrefix, parentId, emitEvent)
-  local parentTarget, isPausedOrMaxed = getTargetQueueList(parentPrefix .. "meta", parentPrefix .. "active",
-    parentPrefix .. "wait", parentPrefix .. "paused")
-  addJobInTargetList(parentTarget, parentPrefix .. "marker", "RPUSH", isPausedOrMaxed, parentId)
+  local isPausedOrMaxed =
+    isQueuePausedOrMaxed(parentPrefix .. "meta", parentPrefix .. "active")
+  addJobInTargetList(parentPrefix .. "wait", parentPrefix .. "marker", "RPUSH", isPausedOrMaxed, parentId)
   if emitEvent then
     local parentEventStream = parentPrefix .. "events"
     rcall("XADD", parentEventStream, "*", "event", "waiting", "jobId", parentId, "prev", "waiting-children")

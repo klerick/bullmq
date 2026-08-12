@@ -20,22 +20,6 @@
 local rcall = redis.call
 -- Includes
 --[[
-  Function to add job in target list and add marker if needed.
-]]
--- Includes
---[[
-  Add marker if needed when a job is available.
-]]
-local function addBaseMarkerIfNeeded(markerKey, isPausedOrMaxed)
-  if not isPausedOrMaxed then
-    rcall("ZADD", markerKey, 0, "0")
-  end  
-end
-local function addJobInTargetList(targetKey, markerKey, pushCmd, isPausedOrMaxed, jobId)
-  rcall(pushCmd, targetKey, jobId)
-  addBaseMarkerIfNeeded(markerKey, isPausedOrMaxed)
-end
---[[
   Function to loop in batches.
   Just a bit of warning, some commands as ZREM
   could receive a maximum of 7000 parameters per call.
@@ -56,29 +40,41 @@ end
 ]]
 -- Includes
 --[[
-  Function to check for the meta.paused key to decide if we are paused or not
+  Function to add job in target list and add marker if needed.
+]]
+-- Includes
+--[[
+  Add marker if needed when a job is available.
+]]
+local function addBaseMarkerIfNeeded(markerKey, isPausedOrMaxed)
+  if not isPausedOrMaxed then
+    rcall("ZADD", markerKey, 0, "0")
+  end  
+end
+local function addJobInTargetList(targetKey, markerKey, pushCmd, isPausedOrMaxed, jobId)
+  rcall(pushCmd, targetKey, jobId)
+  addBaseMarkerIfNeeded(markerKey, isPausedOrMaxed)
+end
+--[[
+  Function to check if queue is paused or maxed
   (since an empty list and !EXISTS are not really the same).
 ]]
-local function getTargetQueueList(queueMetaKey, activeKey, waitKey, pausedKey)
-  local queueAttributes = rcall("HMGET", queueMetaKey, "paused", "concurrency", "max", "duration")
+local function isQueuePausedOrMaxed(queueMetaKey, activeKey)
+  local queueAttributes = rcall("HMGET", queueMetaKey, "paused", "concurrency")
   if queueAttributes[1] then
-    return pausedKey, true, queueAttributes[3], queueAttributes[4]
+    return true
   else
     if queueAttributes[2] then
       local activeCount = rcall("LLEN", activeKey)
-      if activeCount >= tonumber(queueAttributes[2]) then
-        return waitKey, true, queueAttributes[3], queueAttributes[4]
-      else
-        return waitKey, false, queueAttributes[3], queueAttributes[4]
-      end
+      return activeCount >= tonumber(queueAttributes[2])
     end
   end
-  return waitKey, false, queueAttributes[3], queueAttributes[4]
+  return false
 end
 local function moveJobToWait(metaKey, activeKey, waitKey, pausedKey, markerKey, eventStreamKey,
   jobId, pushCmd)
-  local target, isPausedOrMaxed = getTargetQueueList(metaKey, activeKey, waitKey, pausedKey)
-  addJobInTargetList(target, markerKey, pushCmd, isPausedOrMaxed, jobId)
+  local isPausedOrMaxed = isQueuePausedOrMaxed(metaKey, activeKey)
+  addJobInTargetList(waitKey, markerKey, pushCmd, isPausedOrMaxed, jobId)
   rcall("XADD", eventStreamKey, "*", "event", "waiting", "jobId", jobId, 'prev', 'active')
 end
 --[[

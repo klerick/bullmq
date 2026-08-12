@@ -129,6 +129,25 @@ end
 ]]
 -- Includes
 --[[
+  Function to get queue metadata.
+]]
+local function getQueueMetadata(queueMetaKey, activeKey, waitKey)
+  local queueAttributes = rcall("HMGET", queueMetaKey, "paused", "concurrency", "max", "duration")
+  if queueAttributes[1] then
+    return true, queueAttributes[3], queueAttributes[4]
+  else
+    if queueAttributes[2] then
+      local activeCount = rcall("LLEN", activeKey)
+      if activeCount >= tonumber(queueAttributes[2]) then
+        return true, queueAttributes[3], queueAttributes[4]
+      else
+        return false, queueAttributes[3], queueAttributes[4]
+      end
+    end
+  end
+  return false, queueAttributes[3], queueAttributes[4]
+end
+--[[
   Function to return the next delayed job timestamp.
 ]]
 local function getNextDelayedTimestamp(delayedKey)
@@ -154,26 +173,6 @@ local function getRateLimitTTL(maxJobs, rateLimiterKey)
     end
   end
   return 0
-end
---[[
-  Function to check for the meta.paused key to decide if we are paused or not
-  (since an empty list and !EXISTS are not really the same).
-]]
-local function getTargetQueueList(queueMetaKey, activeKey, waitKey, pausedKey)
-  local queueAttributes = rcall("HMGET", queueMetaKey, "paused", "concurrency", "max", "duration")
-  if queueAttributes[1] then
-    return pausedKey, true, queueAttributes[3], queueAttributes[4]
-  else
-    if queueAttributes[2] then
-      local activeCount = rcall("LLEN", activeKey)
-      if activeCount >= tonumber(queueAttributes[2]) then
-        return waitKey, true, queueAttributes[3], queueAttributes[4]
-      else
-        return waitKey, false, queueAttributes[3], queueAttributes[4]
-      end
-    end
-  end
-  return waitKey, false, queueAttributes[3], queueAttributes[4]
 end
 --[[
   Function to move job from prioritized state to active.
@@ -293,10 +292,10 @@ end
 local function fetchNextJob(waitKey, activeKey, prioritizedKey, eventStreamKey,
     rateLimiterKey, delayedKey, pausedKey, metaKey, pcKey, markerKey, prefix,
     timestamp, opts)
-    local target, isPausedOrMaxed, rateLimitMax, rateLimitDuration =
-        getTargetQueueList(metaKey, activeKey, waitKey, pausedKey)
+    local isPausedOrMaxed, rateLimitMax, rateLimitDuration =
+        getQueueMetadata(metaKey, activeKey, waitKey)
     -- Check if there are delayed jobs that can be promoted
-    promoteDelayedJobs(delayedKey, markerKey, target, prioritizedKey,
+    promoteDelayedJobs(delayedKey, markerKey, waitKey, prioritizedKey,
         eventStreamKey, prefix, timestamp, pcKey, isPausedOrMaxed)
     local maxJobs = tonumber(rateLimitMax or (opts['limiter'] and opts['limiter']['max']))
     -- Check if we are rate limited first.
@@ -390,7 +389,6 @@ local function isQueuePausedOrMaxed(queueMetaKey, activeKey)
 end
 local function moveParentToWait(parentQueueKey, parentKey, parentId, timestamp)
     local parentWaitKey = parentQueueKey .. ":wait"
-    local parentPausedKey = parentQueueKey .. ":paused"
     local parentActiveKey = parentQueueKey .. ":active"
     local parentMetaKey = parentQueueKey .. ":meta"
     local parentMarkerKey = parentQueueKey .. ":marker"
@@ -407,9 +405,9 @@ local function moveParentToWait(parentQueueKey, parentKey, parentId, timestamp)
         addDelayMarkerIfNeeded(parentMarkerKey, parentDelayedKey)
     else
         if priority == 0 then
-            local parentTarget, isParentPausedOrMaxed = getTargetQueueList(parentMetaKey, parentActiveKey,
-                parentWaitKey, parentPausedKey)
-            addJobInTargetList(parentTarget, parentMarkerKey, "RPUSH", isParentPausedOrMaxed, parentId)
+            local isParentPausedOrMaxed =
+                isQueuePausedOrMaxed(parentMetaKey, parentActiveKey)
+            addJobInTargetList(parentWaitKey, parentMarkerKey, "RPUSH", isParentPausedOrMaxed, parentId)
         else
             local isPausedOrMaxed = isQueuePausedOrMaxed(parentMetaKey, parentActiveKey)
             addJobWithPriority(parentMarkerKey, parentQueueKey .. ":prioritized", priority, parentId,
@@ -563,9 +561,9 @@ local getJobKeyPrefix = function (jobKey, jobId)
   return string.sub(jobKey, 0, #jobKey - #jobId)
 end
 local function _moveParentToWait(parentPrefix, parentId, emitEvent)
-  local parentTarget, isPausedOrMaxed = getTargetQueueList(parentPrefix .. "meta", parentPrefix .. "active",
-    parentPrefix .. "wait", parentPrefix .. "paused")
-  addJobInTargetList(parentTarget, parentPrefix .. "marker", "RPUSH", isPausedOrMaxed, parentId)
+  local isPausedOrMaxed =
+    isQueuePausedOrMaxed(parentPrefix .. "meta", parentPrefix .. "active")
+  addJobInTargetList(parentPrefix .. "wait", parentPrefix .. "marker", "RPUSH", isPausedOrMaxed, parentId)
   if emitEvent then
     local parentEventStream = parentPrefix .. "events"
     rcall("XADD", parentEventStream, "*", "event", "waiting", "jobId", parentId, "prev", "waiting-children")
@@ -807,13 +805,13 @@ local function storeAndEnqueueJob(eventsKey, jobIdKey, jobId, name, data, opts,
   if delay ~= 0 and delayedKey then
     addDelayedJob(jobId, delayedKey, eventsKey, timestamp, maxEvents, markerKey, delay)
   else
-    local target, isPausedOrMaxed = getTargetQueueList(metaKey, activeKey, waitKey, pausedKey)
+    local isPausedOrMaxed = isQueuePausedOrMaxed(metaKey, activeKey)
     if priority > 0 then
       addJobWithPriority(markerKey, prioritizedKey, priority, jobId,
           priorityCounterKey, isPausedOrMaxed)
     else
       local pushCmd = opts['lifo'] and 'RPUSH' or 'LPUSH'
-      addJobInTargetList(target, markerKey, pushCmd, isPausedOrMaxed, jobId)
+      addJobInTargetList(waitKey, markerKey, pushCmd, isPausedOrMaxed, jobId)
     end
     rcall("XADD", eventsKey, "MAXLEN", "~", maxEvents, "*", "event", "waiting",
         "jobId", jobId)

@@ -209,18 +209,31 @@ func (q *Queue) GetMetrics(ctx context.Context, metricType string, start, end in
 	return q.scripts.getMetrics(ctx, metricType, start, end)
 }
 
-// Pause stops the queue from handing out new jobs (wait -> paused).
+// Pause stops the queue from handing out new jobs. Jobs stay in wait; the marker
+// is dropped so workers stop waking up, and the paused flag makes moveToActive
+// hand out nothing.
 func (q *Queue) Pause(ctx context.Context) (err error) {
 	ctx, span := q.tel.start(ctx, SpanKindInternal, "pause")
 	defer func() { span.finish(err) }()
-	return q.scripts.pause(ctx, true)
+	_, err = q.scripts.pause(ctx, true, true)
+	return err
 }
 
-// Resume undoes Pause (paused -> wait).
+// Resume undoes Pause. A queue paused by a pre-v6 runtime still holds jobs in the
+// legacy paused list, which the script migrates back into wait in batches — so
+// this loops until none are left, emitting the resumed event only once.
 func (q *Queue) Resume(ctx context.Context) (err error) {
 	ctx, span := q.tel.start(ctx, SpanKindInternal, "resume")
 	defer func() { span.finish(err) }()
-	return q.scripts.pause(ctx, false)
+	for emitEvent := true; ; emitEvent = false {
+		remaining, e := q.scripts.pause(ctx, false, emitEvent)
+		if e != nil {
+			return e
+		}
+		if remaining <= 0 {
+			return nil
+		}
+	}
 }
 
 // IsPaused reports whether the queue is paused.

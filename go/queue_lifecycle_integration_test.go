@@ -3,14 +3,21 @@ package bullmq
 import (
 	"context"
 	"errors"
+	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
+// Pausing no longer drains wait into a separate paused list (BullMQ v6 dropped
+// that list): jobs stay in wait and the marker is deleted, which is what stops
+// workers from picking them up. So the assertion is behavioural — a paused queue
+// hands out nothing, a resumed one does.
 func TestQueuePauseResume(t *testing.T) {
 	client := requireRedis(t)
 	t.Cleanup(func() { _ = client.Close() })
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
 	if err := client.FlushDB(ctx).Err(); err != nil {
 		t.Fatalf("flushdb: %v", err)
 	}
@@ -28,8 +35,27 @@ func TestQueuePauseResume(t *testing.T) {
 	if paused, _ := q.IsPaused(ctx); !paused {
 		t.Error("queue should be paused")
 	}
-	if n, _ := q.GetWaitingCount(ctx); n != 0 {
-		t.Errorf("waiting after pause = %d, want 0 (moved to paused)", n)
+	if n, _ := q.GetWaitingCount(ctx); n != 1 {
+		t.Errorf("waiting while paused = %d, want 1 (v6 keeps jobs in wait)", n)
+	}
+	if n, _ := client.Exists(ctx, q.keys.Marker()).Result(); n != 0 {
+		t.Error("marker should be dropped while paused, or workers keep waking up")
+	}
+
+	var processed atomic.Int64
+	w, err := NewWorker("go-pause", func(ctx context.Context, j *Job) (any, error) {
+		processed.Add(1)
+		return nil, nil
+	}, WithClient(client))
+	if err != nil {
+		t.Fatalf("NewWorker: %v", err)
+	}
+	defer w.Close()
+	go func() { _ = w.Run(ctx) }()
+
+	time.Sleep(500 * time.Millisecond)
+	if n := processed.Load(); n != 0 {
+		t.Errorf("worker processed %d jobs while paused, want 0", n)
 	}
 
 	if err := q.Resume(ctx); err != nil {
@@ -38,8 +64,50 @@ func TestQueuePauseResume(t *testing.T) {
 	if paused, _ := q.IsPaused(ctx); paused {
 		t.Error("queue should be resumed")
 	}
-	if n, _ := q.GetWaitingCount(ctx); n != 1 {
-		t.Errorf("waiting after resume = %d, want 1", n)
+	eventually(t, 5*time.Second, func() bool { return processed.Load() == 1 })
+}
+
+// A queue paused by a v5 runtime still holds jobs in the legacy paused list. The
+// v6 script migrates them back to wait in batches of 7000 and reports how many
+// are left, so Resume must keep calling it until none remain — one call would
+// strand everything past the first batch.
+func TestResumeMigratesLegacyPausedJobs(t *testing.T) {
+	client := requireRedis(t)
+	t.Cleanup(func() { _ = client.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := client.FlushDB(ctx).Err(); err != nil {
+		t.Fatalf("flushdb: %v", err)
+	}
+	q, _ := NewQueue("go-legacy-pause", WithClient(client))
+	defer q.Close()
+
+	// A job already in wait forces the batching path: with an empty wait the
+	// script just renames the whole list in one go and never loops.
+	if err := client.LPush(ctx, q.keys.Wait(), "existing").Err(); err != nil {
+		t.Fatalf("seed wait: %v", err)
+	}
+	// Two batches worth, as a v5 runtime would have left them.
+	const legacyJobs = 7003
+	ids := make([]any, legacyJobs)
+	for i := range ids {
+		ids[i] = strconv.Itoa(i + 1)
+	}
+	if err := client.LPush(ctx, q.keys.Paused(), ids...).Err(); err != nil {
+		t.Fatalf("seed legacy paused list: %v", err)
+	}
+	if err := client.HSet(ctx, q.keys.Meta(), "paused", 1).Err(); err != nil {
+		t.Fatalf("mark paused: %v", err)
+	}
+
+	if err := q.Resume(ctx); err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	if n, _ := client.LLen(ctx, q.keys.Paused()).Result(); n != 0 {
+		t.Errorf("%d jobs left in the legacy paused list, want 0", n)
+	}
+	if n, _ := client.LLen(ctx, q.keys.Wait()).Result(); n != legacyJobs+1 {
+		t.Errorf("wait holds %d jobs, want all %d migrated plus the pre-existing one", n, legacyJobs)
 	}
 }
 

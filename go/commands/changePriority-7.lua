@@ -55,24 +55,20 @@ local function addJobWithPriority(markerKey, prioritizedKey, priority, jobId, pr
   addBaseMarkerIfNeeded(markerKey, isPausedOrMaxed)
 end
 --[[
-  Function to check for the meta.paused key to decide if we are paused or not
+  Function to check if queue is paused or maxed
   (since an empty list and !EXISTS are not really the same).
 ]]
-local function getTargetQueueList(queueMetaKey, activeKey, waitKey, pausedKey)
-  local queueAttributes = rcall("HMGET", queueMetaKey, "paused", "concurrency", "max", "duration")
+local function isQueuePausedOrMaxed(queueMetaKey, activeKey)
+  local queueAttributes = rcall("HMGET", queueMetaKey, "paused", "concurrency")
   if queueAttributes[1] then
-    return pausedKey, true, queueAttributes[3], queueAttributes[4]
+    return true
   else
     if queueAttributes[2] then
       local activeCount = rcall("LLEN", activeKey)
-      if activeCount >= tonumber(queueAttributes[2]) then
-        return waitKey, true, queueAttributes[3], queueAttributes[4]
-      else
-        return waitKey, false, queueAttributes[3], queueAttributes[4]
-      end
+      return activeCount >= tonumber(queueAttributes[2])
     end
   end
-  return waitKey, false, queueAttributes[3], queueAttributes[4]
+  return false
 end
 --[[
   Function to push back job considering priority in front of same prioritized jobs.
@@ -83,11 +79,11 @@ local function pushBackJobWithPriority(prioritizedKey, priority, jobId)
   local score = priority * 0x100000000
   rcall("ZADD", prioritizedKey, score, jobId)
 end
-local function reAddJobWithNewPriority( prioritizedKey, markerKey, targetKey,
+local function reAddJobWithNewPriority( prioritizedKey, markerKey, waitKey,
     priorityCounter, lifo, priority, jobId, isPausedOrMaxed)
     if priority == 0 then
         local pushCmd = lifo and 'RPUSH' or 'LPUSH'
-        addJobInTargetList(targetKey, markerKey, pushCmd, isPausedOrMaxed, jobId)
+        addJobInTargetList(waitKey, markerKey, pushCmd, isPausedOrMaxed, jobId)
     else
         if lifo then
             pushBackJobWithPriority(prioritizedKey, priority, jobId)
@@ -99,16 +95,19 @@ local function reAddJobWithNewPriority( prioritizedKey, markerKey, targetKey,
 end
 if rcall("EXISTS", jobKey) == 1 then
     local metaKey = KEYS[3]
-    local target, isPausedOrMaxed = getTargetQueueList(metaKey, KEYS[5], KEYS[1], KEYS[2])
+    local activeKey = KEYS[5]
+    local waitKey = KEYS[1]
+    local pausedKey = KEYS[2]
+    local isPausedOrMaxed = isQueuePausedOrMaxed(metaKey, activeKey)
     local prioritizedKey = KEYS[4]
     local priorityCounterKey = KEYS[6]
     local markerKey = KEYS[7]
     -- Re-add with the new priority
     if rcall("ZREM", prioritizedKey, jobId) > 0 then
-        reAddJobWithNewPriority( prioritizedKey, markerKey, target,
+        reAddJobWithNewPriority( prioritizedKey, markerKey, waitKey,
             priorityCounterKey, ARGV[4] == '1', priority, jobId, isPausedOrMaxed)
-    elseif rcall("LREM", target, -1, jobId) > 0 then
-        reAddJobWithNewPriority( prioritizedKey, markerKey, target,
+    elseif rcall("LREM", waitKey, -1, jobId) > 0 then
+        reAddJobWithNewPriority( prioritizedKey, markerKey, waitKey,
             priorityCounterKey, ARGV[4] == '1', priority, jobId, isPausedOrMaxed)
     end
     rcall("HSET", jobKey, "priority", priority)

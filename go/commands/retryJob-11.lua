@@ -73,26 +73,6 @@ local function getOrSetMaxEvents(metaKey)
   return maxEvents
 end
 --[[
-  Function to check for the meta.paused key to decide if we are paused or not
-  (since an empty list and !EXISTS are not really the same).
-]]
-local function getTargetQueueList(queueMetaKey, activeKey, waitKey, pausedKey)
-  local queueAttributes = rcall("HMGET", queueMetaKey, "paused", "concurrency", "max", "duration")
-  if queueAttributes[1] then
-    return pausedKey, true, queueAttributes[3], queueAttributes[4]
-  else
-    if queueAttributes[2] then
-      local activeCount = rcall("LLEN", activeKey)
-      if activeCount >= tonumber(queueAttributes[2]) then
-        return waitKey, true, queueAttributes[3], queueAttributes[4]
-      else
-        return waitKey, false, queueAttributes[3], queueAttributes[4]
-      end
-    end
-  end
-  return waitKey, false, queueAttributes[3], queueAttributes[4]
-end
---[[
   Function to check if queue is paused or maxed
   (since an empty list and !EXISTS are not really the same).
 ]]
@@ -170,11 +150,11 @@ local function updateJobFields(jobKey, msgpackedFields)
     end
   end
 end
-local target, isPausedOrMaxed = getTargetQueueList(KEYS[5], KEYS[1], KEYS[2], KEYS[3])
+local isPausedOrMaxed = isQueuePausedOrMaxed(KEYS[5], KEYS[1])
 local markerKey = KEYS[10]
 -- Check if there are delayed jobs that we can move to wait.
 -- test example: when there are delayed jobs between retries
-promoteDelayedJobs(KEYS[7], markerKey, target, KEYS[8], KEYS[6], ARGV[1], ARGV[2], KEYS[9], isPausedOrMaxed)
+promoteDelayedJobs(KEYS[7], markerKey, KEYS[2], KEYS[8], KEYS[6], ARGV[1], ARGV[2], KEYS[9], isPausedOrMaxed)
 local jobKey = KEYS[4]
 if rcall("EXISTS", jobKey) == 1 then
   local errorCode = removeLock(jobKey, KEYS[11], ARGV[5], ARGV[4]) 
@@ -189,7 +169,7 @@ if rcall("EXISTS", jobKey) == 1 then
   isPausedOrMaxed = isQueuePausedOrMaxed(KEYS[5], KEYS[1])
   -- Standard or priority add
   if priority == 0 then
-    addJobInTargetList(target, markerKey, ARGV[3], isPausedOrMaxed, ARGV[4])
+    addJobInTargetList(KEYS[2], markerKey, ARGV[3], isPausedOrMaxed, ARGV[4])
   else
     addJobWithPriority(markerKey, KEYS[8], priority, ARGV[4], KEYS[9], isPausedOrMaxed)
   end

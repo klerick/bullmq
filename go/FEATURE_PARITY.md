@@ -5,6 +5,12 @@ the same include-resolved Lua scripts (embedded from `rawScripts`), so a Go
 producer/consumer interoperates with any other BullMQ port. Interop is verified by
 cross-runtime tests against Node BullMQ (see `interop_test.go`, `cron_interop_test.go`).
 
+**Scripts are synced from upstream BullMQ v6** (6.0.10); interop tests run against
+`bullmq@6.0.10`. v6 dropped the separate `paused` list — pausing now only sets the
+meta flag and deletes the marker, leaving jobs in `wait`. A queue shared with a
+pre-v6 runtime therefore disagrees about where paused jobs live; `Resume` migrates
+whatever a v5 runtime left in the legacy list back into `wait`.
+
 ## Legend
 
 - ✅ Implemented
