@@ -133,16 +133,31 @@ func TestQueueGetCountsPerPriority(t *testing.T) {
 	q, _ := NewQueue("go-prio", WithClient(client))
 	defer q.Close()
 
+	_, _ = q.Add(ctx, "p0", nil, nil)
 	_, _ = q.Add(ctx, "p1a", nil, &JobOptions{Priority: 1})
 	_, _ = q.Add(ctx, "p1b", nil, &JobOptions{Priority: 1})
 	_, _ = q.Add(ctx, "p2", nil, &JobOptions{Priority: 2})
 
-	counts, err := q.GetCountsPerPriority(ctx, []int{1, 2})
+	counts, err := q.GetCountsPerPriority(ctx, []int{0, 1, 2})
 	if err != nil {
 		t.Fatalf("GetCountsPerPriority: %v", err)
 	}
-	if len(counts) != 2 || counts[0] != 2 || counts[1] != 1 {
-		t.Errorf("counts per priority [1,2] = %v, want [2 1]", counts)
+	if len(counts) != 3 || counts[0] != 1 || counts[1] != 2 || counts[2] != 1 {
+		t.Errorf("counts per priority [0,1,2] = %v, want [1 2 1]", counts)
+	}
+
+	// Priority 0 means the wait list. v5 counted the paused list instead while the
+	// queue was paused; v6 dropped that branch along with the list itself, so the
+	// count must not change when pausing.
+	if err := q.Pause(ctx); err != nil {
+		t.Fatalf("Pause: %v", err)
+	}
+	counts, err = q.GetCountsPerPriority(ctx, []int{0, 1, 2})
+	if err != nil {
+		t.Fatalf("GetCountsPerPriority while paused: %v", err)
+	}
+	if len(counts) != 3 || counts[0] != 1 || counts[1] != 2 || counts[2] != 1 {
+		t.Errorf("counts per priority while paused = %v, want [1 2 1]", counts)
 	}
 }
 

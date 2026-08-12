@@ -135,3 +135,68 @@ func TestInteropNodeAddGoProcesses(t *testing.T) {
 		return client.ZScore(ctx, q.keys.Completed(), jobID).Err() == nil
 	})
 }
+
+// v6 dropped the paused list, so a paused queue keeps its jobs in wait. That
+// shifts what the counting API reports, and the Go port must shift with it —
+// this compares our counts against Node's on the very same Redis state, paused
+// and unpaused, rather than trusting either side's reading of the schema.
+func TestInteropJobCountsMatchNode(t *testing.T) {
+	requireNodeInterop(t)
+	client := requireRedis(t)
+	t.Cleanup(func() { _ = client.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := client.FlushDB(ctx).Err(); err != nil {
+		t.Fatalf("flushdb: %v", err)
+	}
+
+	q, err := NewQueue("interop-counts", WithClient(client))
+	if err != nil {
+		t.Fatalf("NewQueue: %v", err)
+	}
+	defer q.Close()
+
+	// A mixed state, so a single wrong key would show up as a mismatch.
+	for i := 0; i < 3; i++ {
+		if _, err := q.Add(ctx, "plain", nil, nil); err != nil {
+			t.Fatalf("Add: %v", err)
+		}
+	}
+	if _, err := q.Add(ctx, "later", nil, &JobOptions{Delay: 60000}); err != nil {
+		t.Fatalf("Add delayed: %v", err)
+	}
+	if _, err := q.Add(ctx, "urgent", nil, &JobOptions{Priority: 1}); err != nil {
+		t.Fatalf("Add prioritized: %v", err)
+	}
+
+	types := []string{"waiting", "paused", "delayed", "prioritized", "active"}
+	compare := func(stage string) {
+		t.Helper()
+		mine, err := q.GetJobCounts(ctx, types...)
+		if err != nil {
+			t.Fatalf("%s: GetJobCounts: %v", stage, err)
+		}
+		var theirs map[string]int64
+		out := runNode(t, "counts.mjs", "bull", "interop-counts", strings.Join(types, ","))
+		if err := json.Unmarshal([]byte(out), &theirs); err != nil {
+			t.Fatalf("%s: node counts are not JSON: %v (%q)", stage, err, out)
+		}
+		for _, ty := range types {
+			if mine[ty] != theirs[ty] {
+				t.Errorf("%s: %s count = %d (Go) vs %d (Node)", stage, ty, mine[ty], theirs[ty])
+			}
+		}
+	}
+
+	compare("running")
+
+	if err := q.Pause(ctx); err != nil {
+		t.Fatalf("Pause: %v", err)
+	}
+	compare("paused")
+
+	// Pausing must not have moved anything: the jobs are still counted as waiting.
+	if n, _ := q.GetWaitingCount(ctx); n != 3 {
+		t.Errorf("waiting while paused = %d, want 3 (v6 keeps jobs in wait)", n)
+	}
+}
