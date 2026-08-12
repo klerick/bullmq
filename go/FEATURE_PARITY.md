@@ -83,6 +83,11 @@ jobId ✅ · removeOnComplete/removeOnFail ✅ · deduplication ✅ · repeat/cr
 failParentOnFailure / removeDependencyOnFailure / ignoreDependencyOnFailure /
 continueParentOnFailure ✅ (stored) · keepLogs 🚧 · sizeLimit ✅ · telemetry ✅ (trace propagation via tm)
 
+Trace context is injected on every producing path — `Queue.Add`, `Queue.AddBulk`,
+`FlowProducer.Add` (per node, as upstream's addFlow/addNode do) and job schedulers.
+Upstream's `telemetry.omitContext` opt-out is **not** ported: set `JobOptions.Extra["tm"]`
+explicitly to override what a job propagates (an explicit value always wins).
+
 ## Connection & infrastructure
 
 | Feature                                         | Status        |

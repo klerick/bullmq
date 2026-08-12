@@ -31,6 +31,7 @@ type JobNode struct {
 type FlowProducer struct {
 	conn     *connection
 	prefix   string
+	tel      Telemetry
 	loadOnce sync.Once
 	loadErr  error
 }
@@ -42,7 +43,13 @@ func NewFlowProducer(opts ...Option) (*FlowProducer, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &FlowProducer{conn: conn, prefix: cfg.prefix}, nil
+	return &FlowProducer{conn: conn, prefix: cfg.prefix, tel: cfg.telemetry}, nil
+}
+
+// telFor builds the span helper for one queue. Unlike a Queue, a flow spans many
+// queues, so the span-name prefix belongs to the node, not to the producer.
+func (fp *FlowProducer) telFor(queueName string) telemetryHelper {
+	return telemetryHelper{t: fp.tel, name: queueName}
 }
 
 // ensureLoaded pre-loads every script (SCRIPT LOAD) once, so EVALSHA succeeds
@@ -59,22 +66,31 @@ func (fp *FlowProducer) Add(ctx context.Context, flow *FlowJob) (*JobNode, error
 	}
 
 	var tree *JobNode
-	var cmds []*redis.Cmd
-	_, err := fp.conn.client.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
-		var e error
-		tree, e = fp.addNode(ctx, pipe, &cmds, flow, nil)
-		return e
+	err := fp.telFor(flow.QueueName).trace(ctx, SpanKindProducer, "addFlow", func(ctx context.Context, span Span) error {
+		if span != nil {
+			span.SetAttributes(map[string]any{"bullmq.queue": flow.QueueName, "bullmq.flow.name": flow.Name})
+		}
+		var cmds []*redis.Cmd
+		_, err := fp.conn.client.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+			var e error
+			tree, e = fp.addNode(ctx, pipe, &cmds, flow, nil)
+			return e
+		})
+		if err != nil {
+			return err
+		}
+		// Surface any negative status code the scripts returned inside the pipeline.
+		for _, cmd := range cmds {
+			if res, err := cmd.Result(); err != nil {
+				return err
+			} else if code, ok := res.(int64); ok && code < 0 {
+				return finishedError(ScriptErrorCode(code), errorContext{command: "addJob"})
+			}
+		}
+		return nil
 	})
 	if err != nil {
 		return nil, err
-	}
-	// Surface any negative status code the scripts returned inside the pipeline.
-	for _, cmd := range cmds {
-		if res, err := cmd.Result(); err != nil {
-			return nil, err
-		} else if code, ok := res.(int64); ok && code < 0 {
-			return nil, finishedError(ScriptErrorCode(code), errorContext{command: "addJob"})
-		}
 	}
 	return tree, nil
 }
@@ -88,6 +104,7 @@ func (fp *FlowProducer) addNode(ctx context.Context, pipe redis.Pipeliner, cmds 
 		prefix = fp.prefix
 	}
 	sc := newScripts(fp.conn, prefix, node.QueueName)
+	tel := fp.telFor(node.QueueName)
 
 	opts := JobOptions{}
 	if node.Opts != nil {
@@ -100,34 +117,50 @@ func (fp *FlowProducer) addNode(ctx context.Context, pipe redis.Pipeliner, cmds 
 		opts.JobID = genID()
 	}
 
-	q := &Queue{name: node.QueueName, prefix: prefix, conn: fp.conn, keys: NewQueueKeys(node.QueueName, prefix), scripts: sc}
-	job := newJob(q, node.Name, node.Data, &opts)
+	// One span per node, opened inside the parent node's span (and inside addFlow),
+	// so the trace mirrors the tree and each job propagates its own span through tm.
+	var out *JobNode
+	err := tel.trace(ctx, SpanKindProducer, "addNode", func(ctx context.Context, span Span) error {
+		q := &Queue{name: node.QueueName, prefix: prefix, conn: fp.conn,
+			keys: NewQueueKeys(node.QueueName, prefix), scripts: sc, tel: tel}
+		job := newJob(q, node.Name, node.Data, &opts)
+		tel.injectTM(ctx, job.opts)
+		if span != nil {
+			span.SetAttributes(map[string]any{"bullmq.queue": node.QueueName, "bullmq.job.name": node.Name, "bullmq.job.id": job.ID})
+		}
 
-	if len(node.Children) > 0 {
-		cmd, err := sc.enqueueAddParentJob(ctx, pipe, job)
+		if len(node.Children) > 0 {
+			cmd, err := sc.enqueueAddParentJob(ctx, pipe, job)
+			if err != nil {
+				return err
+			}
+			*cmds = append(*cmds, cmd)
+
+			childParent := &ParentOptions{ID: job.ID, Queue: sc.keys.QualifiedName()}
+			children := make([]*JobNode, 0, len(node.Children))
+			for _, child := range node.Children {
+				cn, err := fp.addNode(ctx, pipe, cmds, child, childParent)
+				if err != nil {
+					return err
+				}
+				children = append(children, cn)
+			}
+			out = &JobNode{Job: job, Children: children}
+			return nil
+		}
+
+		cmd, err := sc.enqueueAddJob(ctx, pipe, job)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		*cmds = append(*cmds, cmd)
-
-		childParent := &ParentOptions{ID: job.ID, Queue: sc.keys.QualifiedName()}
-		children := make([]*JobNode, 0, len(node.Children))
-		for _, child := range node.Children {
-			cn, err := fp.addNode(ctx, pipe, cmds, child, childParent)
-			if err != nil {
-				return nil, err
-			}
-			children = append(children, cn)
-		}
-		return &JobNode{Job: job, Children: children}, nil
-	}
-
-	cmd, err := sc.enqueueAddJob(ctx, pipe, job)
+		out = &JobNode{Job: job}
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	*cmds = append(*cmds, cmd)
-	return &JobNode{Job: job}, nil
+	return out, nil
 }
 
 // Close releases resources, closing only clients the producer owns.

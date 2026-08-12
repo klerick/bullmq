@@ -73,6 +73,24 @@ func (h telemetryHelper) inject(ctx context.Context) string {
 	return h.t.Inject(ctx)
 }
 
+// injectTM stores the trace context of ctx on a job's options under `tm`, the key
+// every BullMQ port reads to continue a trace on the consumer side (see the worker's
+// extract). It is the single injection point shared by all producing paths — plain
+// add, bulk add, flows and schedulers — so they cannot drift apart.
+//
+// ctx must already carry the producing span: what a job propagates is that span,
+// not the caller's ambient one (upstream's dstPropagationMetadata). Metadata set
+// explicitly on the job wins, mirroring upstream's
+// `opts.telemetry?.metadata || srcPropagationMetadata`.
+func (h telemetryHelper) injectTM(ctx context.Context, opts map[string]any) {
+	if h.t == nil || opts == nil || toStr(opts["tm"]) != "" {
+		return
+	}
+	if md := h.t.Inject(ctx); md != "" {
+		opts["tm"] = md
+	}
+}
+
 func (h telemetryHelper) extract(ctx context.Context, metadata string) context.Context {
 	if h.t == nil || metadata == "" {
 		return ctx

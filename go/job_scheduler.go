@@ -66,13 +66,16 @@ type JobSchedulerJSON struct {
 
 // UpsertJobScheduler creates or replaces a job scheduler and enqueues its first
 // job (immediate for a plain interval, otherwise delayed), returning that job.
-func (q *Queue) UpsertJobScheduler(ctx context.Context, id string, repeat RepeatOptions, name string, data any, opts *JobOptions) (_ *Job, err error) {
-	ctx, span := q.tel.start(ctx, SpanKindProducer, "upsertJobScheduler")
-	defer func() { span.finish(err) }()
+func (q *Queue) UpsertJobScheduler(ctx context.Context, id string, repeat RepeatOptions, name string, data any, opts *JobOptions) (*Job, error) {
 	return q.upsertJobScheduler(ctx, id, repeat, name, data, opts, true, "")
 }
 
-func (q *Queue) upsertJobScheduler(ctx context.Context, id string, repeat RepeatOptions, name string, data any, opts *JobOptions, override bool, producerID string) (*Job, error) {
+// upsertJobScheduler carries the span for both entry points — the public API and
+// the worker scheduling the next iteration — so every produced job propagates the
+// trace it was produced under, as upstream's single traced method does.
+func (q *Queue) upsertJobScheduler(ctx context.Context, id string, repeat RepeatOptions, name string, data any, opts *JobOptions, override bool, producerID string) (_ *Job, err error) {
+	ctx, span := q.tel.start(ctx, SpanKindProducer, "upsertJobScheduler")
+	defer func() { span.finish(err) }()
 	switch {
 	case repeat.Pattern != "" && repeat.Every > 0:
 		return nil, fmt.Errorf("%w: both .Pattern and .Every are set for a scheduler", ErrInvalidConfig)
@@ -165,6 +168,9 @@ func (q *Queue) upsertJobScheduler(ctx context.Context, id string, repeat Repeat
 		repeatMap["endDate"] = repeat.EndDate
 	}
 	merged["repeat"] = repeatMap
+	// Trace context belongs to the produced job, not to the stored template:
+	// upstream puts the propagation metadata in mergedOpts only.
+	q.tel.injectTM(ctx, merged)
 
 	dataJSON, err := marshalJSON(dataOrEmpty(data))
 	if err != nil {
@@ -203,6 +209,8 @@ func (q *Queue) upsertJobScheduler(ctx context.Context, id string, repeat Repeat
 		}
 		job := newJob(q, name, data, opts)
 		job.ID = jobId
+		schedulerJobTM(job, merged)
+		span.setAttrs(map[string]any{"bullmq.job.scheduler.id": id, "bullmq.job.id": job.ID})
 		return job, nil
 	}
 
@@ -215,7 +223,17 @@ func (q *Queue) upsertJobScheduler(ctx context.Context, id string, repeat Repeat
 	}
 	job := newJob(q, name, data, opts)
 	job.ID = jobId
+	schedulerJobTM(job, merged)
+	span.setAttrs(map[string]any{"bullmq.job.scheduler.id": id, "bullmq.job.id": job.ID})
 	return job, nil
+}
+
+// schedulerJobTM mirrors onto the returned handle the trace context that was
+// stored with the job, so the in-memory job matches what Redis holds.
+func schedulerJobTM(job *Job, merged map[string]any) {
+	if tm := toStr(merged["tm"]); tm != "" {
+		job.opts["tm"] = tm
+	}
 }
 
 // GetJobScheduler returns a scheduler by id, or nil if it does not exist.

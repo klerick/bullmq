@@ -52,9 +52,7 @@ func (q *Queue) Add(ctx context.Context, name string, data any, opts *JobOptions
 	var job *Job
 	err := q.tel.trace(ctx, SpanKindProducer, "add", func(ctx context.Context, span Span) error {
 		job = newJob(q, name, data, opts)
-		if md := q.tel.inject(ctx); md != "" {
-			job.opts["tm"] = md // propagate trace context to the consumer
-		}
+		q.tel.injectTM(ctx, job.opts) // propagate trace context to the consumer
 		id, e := q.scripts.addJob(ctx, job)
 		if e != nil {
 			return e
@@ -348,6 +346,7 @@ func (q *Queue) AddBulk(ctx context.Context, specs []BulkJob) (_ []*Job, err err
 	_, err = q.conn.client.Pipelined(ctx, func(pipe redis.Pipeliner) error {
 		for i, spec := range specs {
 			job := newJob(q, spec.Name, spec.Data, spec.Opts)
+			q.tel.injectTM(ctx, job.opts) // every job of the bulk continues the addBulk span
 			jobs[i] = job
 			cmd, e := q.scripts.enqueueAddJob(ctx, pipe, job)
 			if e != nil {
