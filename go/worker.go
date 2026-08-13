@@ -273,6 +273,16 @@ func (w *Worker) processJob(ctx context.Context, job *Job) {
 	pctx, span := w.queue.tel.start(pctx, SpanKindConsumer, "process")
 	span.setAttrs(map[string]any{"bullmq.queue": w.queue.name, "bullmq.job.name": job.Name, "bullmq.job.id": job.ID})
 
+	// A job carrying a deferred failure (a child failed with failParentOnFailure)
+	// must not run: the cascade already decided its outcome, the worker only
+	// executes it. Ported from worker.ts getUnrecoverableErrorMessage.
+	if job.DeferredFailure != "" {
+		deferred := NewUnrecoverableError(job.DeferredFailure)
+		span.finish(deferred)
+		_ = job.moveToFailed(ctx, deferred, fo, false)
+		return
+	}
+
 	result, procErr := w.processor(pctx, job)
 	if procErr != nil {
 		span.finish(procErr)

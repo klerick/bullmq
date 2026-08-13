@@ -123,7 +123,10 @@ func (fp *FlowProducer) addNode(ctx context.Context, pipe redis.Pipeliner, cmds 
 	err := tel.trace(ctx, SpanKindProducer, "addNode", func(ctx context.Context, span Span) error {
 		q := &Queue{name: node.QueueName, prefix: prefix, conn: fp.conn,
 			keys: NewQueueKeys(node.QueueName, prefix), scripts: sc, tel: tel}
-		job := newJob(q, node.Name, node.Data, &opts)
+		job, err := newJob(q, node.Name, node.Data, &opts)
+		if err != nil {
+			return err
+		}
 		tel.injectTM(ctx, job.opts)
 		if span != nil {
 			span.SetAttributes(map[string]any{"bullmq.queue": node.QueueName, "bullmq.job.name": node.Name, "bullmq.job.id": job.ID})

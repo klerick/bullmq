@@ -130,13 +130,13 @@ func TestInjectTMKeepsExplicitMetadata(t *testing.T) {
 	ctx, span := h.start(context.Background(), SpanKindProducer, "add")
 	defer span.finish(nil)
 
-	job := newJob(nil, "task", nil, &JobOptions{Extra: map[string]any{"tm": "explicit"}})
+	job := mustNewJob(t, nil, "task", nil, &JobOptions{Extra: map[string]any{"tm": "explicit"}})
 	h.injectTM(ctx, job.opts)
 	if got := toStr(job.opts["tm"]); got != "explicit" {
 		t.Errorf("tm = %q, want the explicitly set %q", got, "explicit")
 	}
 
-	plain := newJob(nil, "task", nil, nil)
+	plain := mustNewJob(t, nil, "task", nil, nil)
 	h.injectTM(ctx, plain.opts)
 	if got := toStr(plain.opts["tm"]); got != "q.add" {
 		t.Errorf("tm = %q, want the active span %q", got, "q.add")

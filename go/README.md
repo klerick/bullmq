@@ -78,6 +78,22 @@ fp.Add(ctx, &bullmq.FlowJob{
 A parent job completes only after all of its children complete; the cascade is
 handled Redis-side.
 
+By default a child that fails for good keeps blocking its parent: the parent stays
+in `waiting-children` forever. Set one of the four (mutually exclusive) policies on
+the child to decide what should happen instead:
+
+```go
+Opts: &bullmq.JobOptions{
+	Attempts:            3,
+	FailParentOnFailure: true, // parent fails too, with "child <key> failed"
+	// ContinueParentOnFailure:   parent starts as soon as any child fails
+	// IgnoreDependencyOnFailure: parent stops waiting for this child; failure recorded
+	// RemoveDependencyOnFailure: parent stops waiting for this child; nothing recorded
+}
+```
+
+Enabling more than one returns `bullmq.ErrExclusiveParentOptions`.
+
 ## Schedulers
 
 ```go

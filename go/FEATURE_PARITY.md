@@ -66,6 +66,7 @@ whatever a v5 runtime left in the legacy list back into `wait`.
 | Rate limiting (WithLimiter)                       | ✅       |
 | WorkerName / SkipStalledCheck / SkipLockRenewal   | ✅       |
 | Job scheduler next-iteration production           | ✅       |
+| Deferred failure (failParentOnFailure cascade)    | ✅       |
 | Events (via QueueEvents)                          | ✅       |
 | Telemetry / OpenTelemetry (via bullmq/otel)       | ✅       |
 | Custom backoff strategies (WithBackoffStrategy)   | ✅       |
@@ -87,7 +88,11 @@ whatever a v5 runtime left in the legacy list back into `wait`.
 delay ✅ · priority ✅ · attempts ✅ · backoff (fixed/exponential/jitter) ✅ · lifo ✅ ·
 jobId ✅ · removeOnComplete/removeOnFail ✅ · deduplication ✅ · repeat/cron ✅ · parent ✅ ·
 failParentOnFailure / removeDependencyOnFailure / ignoreDependencyOnFailure /
-continueParentOnFailure ✅ (stored) · keepLogs 🚧 · sizeLimit ✅ · telemetry ✅ (trace propagation via tm)
+continueParentOnFailure ✅ · keepLogs ✅ · sizeLimit ✅ · telemetry ✅ (trace propagation via tm)
+
+The four parent-failure options are mutually exclusive (as in python): enabling more
+than one on the same job returns `ErrExclusiveParentOptions`. With none of them set,
+a failed child keeps blocking its parent forever — the upstream default.
 
 Trace context is injected on every producing path — `Queue.Add`, `Queue.AddBulk`,
 `FlowProducer.Add` (per node, as upstream's addFlow/addNode do) and job schedulers.

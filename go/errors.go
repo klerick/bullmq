@@ -13,6 +13,12 @@ var (
 	// ErrWaitingChildren is a signal returned by a processor (or moveToWaitingChildren)
 	// telling the worker not to finalize the job because it now waits for children.
 	ErrWaitingChildren = errors.New("bullmq: job is waiting for children")
+
+	// ErrExclusiveParentOptions is returned when more than one parent-failure
+	// policy (failParentOnFailure, continueParentOnFailure,
+	// ignoreDependencyOnFailure, removeDependencyOnFailure) is enabled on the same
+	// job. Mirrors the ValueError raised by python/bullmq/job.py:73-77.
+	ErrExclusiveParentOptions = errors.New("bullmq: parent-failure options cannot be used together")
 )
 
 // UnrecoverableError marks a failure that must not be retried. A processor can

@@ -10,7 +10,7 @@ import (
 // touches only s.keys, so it needs no live connection.
 func TestAddJobArgsStructure(t *testing.T) {
 	s := &scripts{keys: NewQueueKeys("q", "")}
-	job := newJob(nil, "createUser", map[string]any{"e": "x"}, &JobOptions{JobID: "j1"})
+	job := mustNewJob(t, nil, "createUser", map[string]any{"e": "x"}, &JobOptions{JobID: "j1"})
 
 	argv, err := s.addJobArgs(job)
 	if err != nil {
@@ -61,7 +61,7 @@ func TestAddJobArgsStructure(t *testing.T) {
 // (a nil there would be treated as a real, malformed id).
 func TestAddJobArgsEmptyID(t *testing.T) {
 	s := &scripts{keys: NewQueueKeys("q", "")}
-	job := newJob(nil, "n", nil, nil)
+	job := mustNewJob(t, nil, "n", nil, nil)
 	argv, _ := s.addJobArgs(job)
 	var arr []any
 	_ = msgpack.Unmarshal(argv[0].([]byte), &arr)

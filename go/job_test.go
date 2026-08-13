@@ -2,8 +2,19 @@ package bullmq
 
 import "testing"
 
+// mustNewJob builds a job for tests where the options are known to be valid
+// (newJob only rejects mutually exclusive parent-failure options).
+func mustNewJob(t *testing.T, queue *Queue, name string, data any, o *JobOptions) *Job {
+	t.Helper()
+	j, err := newJob(queue, name, data, o)
+	if err != nil {
+		t.Fatalf("newJob: %v", err)
+	}
+	return j
+}
+
 func TestNewJobBasics(t *testing.T) {
-	j := newJob(nil, "createUser", map[string]any{"email": "a@b.c"}, &JobOptions{
+	j := mustNewJob(t, nil, "createUser", map[string]any{"email": "a@b.c"}, &JobOptions{
 		JobID:    "custom-1",
 		Delay:    5000,
 		Attempts: 3,
@@ -24,7 +35,7 @@ func TestNewJobBasics(t *testing.T) {
 
 // A nil opts pointer must be handled (defaults applied).
 func TestNewJobNilOpts(t *testing.T) {
-	j := newJob(nil, "noop", nil, nil)
+	j := mustNewJob(t, nil, "noop", nil, nil)
 	if j.Timestamp <= 0 {
 		t.Error("Timestamp should default to now for nil opts")
 	}
@@ -36,7 +47,7 @@ func TestNewJobNilOpts(t *testing.T) {
 // Parent options resolve to a parentKey ("{queueKey}:{id}") and a parent record
 // {id, queueKey}, mirroring python get_parent_key + Job.parent.
 func TestNewJobParent(t *testing.T) {
-	j := newJob(nil, "child", nil, &JobOptions{
+	j := mustNewJob(t, nil, "child", nil, &JobOptions{
 		Parent: &ParentOptions{ID: "p1", Queue: "bull:parents"},
 	})
 	if j.ParentKey != "bull:parents:p1" {
@@ -50,7 +61,7 @@ func TestNewJobParent(t *testing.T) {
 // optsMap carries the fields storeJob reads (attempts, delay); deduplication is
 // stored under its long key so encodeOpts can shorten it to "de" at pack time.
 func TestJobOptsMap(t *testing.T) {
-	j := newJob(nil, "j", nil, &JobOptions{Attempts: 2, Delay: 100})
+	j := mustNewJob(t, nil, "j", nil, &JobOptions{Attempts: 2, Delay: 100})
 	m := j.optsMap()
 	if m["attempts"] != 2 {
 		t.Errorf("optsMap attempts = %v, want 2", m["attempts"])

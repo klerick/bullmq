@@ -134,7 +134,11 @@ func (q *Queue) upsertJobScheduler(ctx context.Context, id string, repeat Repeat
 
 	tmpl := map[string]any{}
 	if opts != nil {
-		tmpl = buildOptsMap(opts)
+		failurePolicy, err := resolveParentFailureOptions(opts)
+		if err != nil {
+			return nil, err
+		}
+		tmpl = buildOptsMap(opts, failurePolicy)
 	}
 
 	merged := map[string]any{}
@@ -207,7 +211,10 @@ func (q *Queue) upsertJobScheduler(ctx context.Context, id string, repeat Repeat
 		if err != nil {
 			return nil, err
 		}
-		job := newJob(q, name, data, opts)
+		job, err := newJob(q, name, data, opts)
+		if err != nil {
+			return nil, err
+		}
 		job.ID = jobId
 		schedulerJobTM(job, merged)
 		span.setAttrs(map[string]any{"bullmq.job.scheduler.id": id, "bullmq.job.id": job.ID})
@@ -221,7 +228,10 @@ func (q *Queue) upsertJobScheduler(ctx context.Context, id string, repeat Repeat
 	if jobId == "" {
 		return nil, nil
 	}
-	job := newJob(q, name, data, opts)
+	job, err := newJob(q, name, data, opts)
+	if err != nil {
+		return nil, err
+	}
 	job.ID = jobId
 	schedulerJobTM(job, merged)
 	span.setAttrs(map[string]any{"bullmq.job.scheduler.id": id, "bullmq.job.id": job.ID})

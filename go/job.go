@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -35,7 +36,73 @@ type JobOptions struct {
 	RemoveOnFail     any
 	Parent           *ParentOptions
 	Deduplication    *DeduplicationOptions
-	Extra            map[string]any
+	KeepLogs         int // max log lines kept per job (0 = unlimited)
+
+	// Parent-failure policy: what happens to the parent when this job fails for
+	// good. At most one may be set — combining them is a config error
+	// (ErrExclusiveParentOptions). Without any of them the failed child stays in
+	// the parent's dependencies and the parent waits forever, which is the
+	// upstream default.
+	FailParentOnFailure       bool // parent fails too
+	ContinueParentOnFailure   bool // parent starts as soon as any child fails
+	IgnoreDependencyOnFailure bool // parent stops waiting for this child; failure recorded
+	RemoveDependencyOnFailure bool // parent stops waiting for this child; nothing recorded
+
+	Extra map[string]any
+}
+
+// parentFailureOption is one of the four mutually exclusive parent-failure
+// policies. The enabled one is written into the child's parent record under its
+// short key: that record (hash field "parent") is the only place the Lua scripts
+// read the policy from (moveToFinished-14.lua:460-492) — the copy kept in opts is
+// stored for parity with Node/python but is never consulted by the scripts.
+type parentFailureOption struct {
+	long  string
+	short string
+	field func(*JobOptions) bool
+}
+
+// parentFailureOptions lists the policies in the order python/bullmq/job.py:66-72
+// uses, so a rejected combination is reported identically across ports.
+var parentFailureOptions = []parentFailureOption{
+	{"removeDependencyOnFailure", "rdof", func(o *JobOptions) bool { return o.RemoveDependencyOnFailure }},
+	{"failParentOnFailure", "fpof", func(o *JobOptions) bool { return o.FailParentOnFailure }},
+	{"continueParentOnFailure", "cpof", func(o *JobOptions) bool { return o.ContinueParentOnFailure }},
+	{"ignoreDependencyOnFailure", "idof", func(o *JobOptions) bool { return o.IgnoreDependencyOnFailure }},
+}
+
+// enabled reports whether the policy is on, either through its typed field or
+// through Extra (long or short key) — the escape hatch consumers reached for
+// before the fields existed keeps working rather than silently doing nothing.
+func (p parentFailureOption) enabled(o *JobOptions) bool {
+	if p.field(o) {
+		return true
+	}
+	if b, _ := o.Extra[p.long].(bool); b {
+		return true
+	}
+	b, _ := o.Extra[p.short].(bool)
+	return b
+}
+
+// resolveParentFailureOptions returns the enabled policies, rejecting any
+// combination of them. Ported from python/bullmq/job.py:66-77; validation runs
+// even without a parent, so a bad combo is reported where it was written.
+func resolveParentFailureOptions(o *JobOptions) ([]parentFailureOption, error) {
+	var enabled []parentFailureOption
+	for _, p := range parentFailureOptions {
+		if p.enabled(o) {
+			enabled = append(enabled, p)
+		}
+	}
+	if len(enabled) > 1 {
+		names := make([]string, len(enabled))
+		for i, p := range enabled {
+			names[i] = p.long
+		}
+		return nil, fmt.Errorf("%w: %s", ErrExclusiveParentOptions, strings.Join(names, ", "))
+	}
+	return enabled, nil
 }
 
 // Job is a unit of work in a queue. It is created by Queue.Add / FlowProducer, or
@@ -55,6 +122,10 @@ type Job struct {
 	DeduplicationID string
 	RepeatJobKey    string
 	FailedReason    string
+	// DeferredFailure is set by the failParentOnFailure cascade: Lua moves the
+	// parent back to wait and records why here, leaving the actual failing to the
+	// worker that picks it up (src/classes/worker.ts:951-972).
+	DeferredFailure string
 	ReturnValue     any
 	Progress        any
 
@@ -66,12 +137,17 @@ type Job struct {
 }
 
 // newJob builds a Job from user input, applying defaults and computing the options
-// map that gets packed and stored.
-func newJob(queue *Queue, name string, data any, o *JobOptions) *Job {
+// map that gets packed and stored. It fails on mutually exclusive parent-failure
+// options, the only user input it validates.
+func newJob(queue *Queue, name string, data any, o *JobOptions) (*Job, error) {
 	if o == nil {
 		o = &JobOptions{}
 	}
-	opts := buildOptsMap(o)
+	failurePolicy, err := resolveParentFailureOptions(o)
+	if err != nil {
+		return nil, err
+	}
+	opts := buildOptsMap(o, failurePolicy)
 
 	timestamp := o.Timestamp
 	if timestamp == 0 {
@@ -92,11 +168,16 @@ func newJob(queue *Queue, name string, data any, o *JobOptions) *Job {
 	if o.Parent != nil {
 		j.ParentKey = o.Parent.Queue + ":" + o.Parent.ID // python get_parent_key
 		j.Parent = map[string]any{"id": o.Parent.ID, "queueKey": o.Parent.Queue}
+		// The policy travels inside the parent record, where the Lua cascade reads
+		// it (src/classes/job.ts:216-234).
+		for _, p := range failurePolicy {
+			j.Parent[p.short] = true
+		}
 	}
 	if o.Deduplication != nil {
 		j.DeduplicationID = o.Deduplication.ID
 	}
-	return j
+	return j, nil
 }
 
 // jobFromRaw reconstructs a Job from the flat hash returned by moveToActive,
@@ -119,6 +200,7 @@ func jobFromRaw(queue *Queue, raw map[string]string, jobID string) *Job {
 		Attempts:        int(toInt64(opts["attempts"])),
 		AttemptsStarted: int(toInt64(raw["ats"])),
 		FailedReason:    raw["failedReason"],
+		DeferredFailure: raw["defa"],
 		ParentKey:       raw["parentKey"],
 		RepeatJobKey:    raw["rjk"],
 		opts:            opts,
@@ -139,7 +221,9 @@ func jobFromRaw(queue *Queue, raw map[string]string, jobID string) *Job {
 }
 
 // buildOptsMap turns typed JobOptions into the effective options map (long keys).
-func buildOptsMap(o *JobOptions) map[string]any {
+// failurePolicy is the already-validated parent-failure policy, stored here as
+// upstream does (encodeOpts shortens it at pack time) so it round-trips.
+func buildOptsMap(o *JobOptions, failurePolicy []parentFailureOption) map[string]any {
 	opts := map[string]any{
 		"attempts": o.Attempts,
 		"delay":    o.Delay,
@@ -161,6 +245,12 @@ func buildOptsMap(o *JobOptions) map[string]any {
 	}
 	if o.Deduplication != nil {
 		opts["deduplication"] = map[string]any{"id": o.Deduplication.ID}
+	}
+	if o.KeepLogs > 0 {
+		opts["keepLogs"] = o.KeepLogs
+	}
+	for _, p := range failurePolicy {
+		opts[p.long] = true
 	}
 	for k, v := range o.Extra {
 		opts[k] = v
