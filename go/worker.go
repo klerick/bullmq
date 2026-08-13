@@ -273,27 +273,33 @@ func (w *Worker) processJob(ctx context.Context, job *Job) {
 	pctx, span := w.queue.tel.start(pctx, SpanKindConsumer, "process")
 	span.setAttrs(map[string]any{"bullmq.queue": w.queue.name, "bullmq.job.name": job.Name, "bullmq.job.id": job.ID})
 
-	// A job carrying a deferred failure (a child failed with failParentOnFailure)
-	// must not run: the cascade already decided its outcome, the worker only
-	// executes it. Ported from worker.ts getUnrecoverableErrorMessage.
+	// Finalising runs inside the process context so the complete/fail span nests
+	// under this one, as upstream's handleCompleted/handleFailed do inside the
+	// 'process' span (worker.ts:931-1029).
 	if job.DeferredFailure != "" {
+		// A job carrying a deferred failure (a child failed with failParentOnFailure)
+		// must not run: the cascade already decided its outcome, the worker only
+		// executes it. Ported from worker.ts getUnrecoverableErrorMessage.
 		deferred := NewUnrecoverableError(job.DeferredFailure)
+		_ = job.moveToFailed(pctx, deferred, fo, false)
 		span.finish(deferred)
-		_ = job.moveToFailed(ctx, deferred, fo, false)
 		return
 	}
 
 	result, procErr := w.processor(pctx, job)
 	if procErr != nil {
-		span.finish(procErr)
 		if errors.Is(procErr, ErrWaitingChildren) {
-			return // job intentionally left in waiting-children
+			// Parking a job for its children is not a failure: upstream returns
+			// before moveToFailed and records nothing (worker.ts:1093-1107).
+			span.finish(nil)
+			return
 		}
-		_ = job.moveToFailed(ctx, procErr, fo, false)
+		_ = job.moveToFailed(pctx, procErr, fo, false)
+		span.finish(procErr)
 		return
 	}
+	_ = job.moveToCompleted(pctx, result, fo, false)
 	span.finish(nil)
-	_ = job.moveToCompleted(ctx, result, fo, false)
 }
 
 func (w *Worker) registerActive(jobID, token string) {

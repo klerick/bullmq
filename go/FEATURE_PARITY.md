@@ -99,6 +99,30 @@ Trace context is injected on every producing path — `Queue.Add`, `Queue.AddBul
 Upstream's `telemetry.omitContext` opt-out is **not** ported: set `JobOptions.Extra["tm"]`
 explicitly to override what a job propagates (an explicit value always wins).
 
+Spans ported: `add` / `addBulk` / `addFlow` / `addNode` / `upsertJobScheduler` (producer),
+`process` (consumer), `complete` and `fail` / `retry` / `delay` (internal, nested in
+`process`, named by outcome as upstream's `getSpanOperation`). **Not ported yet:** the
+administrative internal spans around queue and worker lifecycle (`pause`, `resume`,
+`close`, `clean`, `drain`, `obliterate`, `retryJobs`, `promoteJobs`, `removeJob`,
+`getNextJob`, `rateLimit`, `moveStalledJobsToWait`). They observe operations, not jobs,
+so a job's trace is unaffected.
+
+Two deliberate deviations from upstream's telemetry, both verified against Node:
+
+- **Flow nodes without options still propagate.** `flow-producer.ts:394` guards the
+  injection with `&& opts`, so a node given no options stores no `tm` and its consumer
+  opens a _new root trace_. No other producing path in upstream does this
+  (`queue.ts:324`, `queue.ts:409`, `job-scheduler.ts:196` all inject regardless), so the
+  port treats it as an upstream slip and injects for every node — otherwise the
+  api→queue trace breaks for the most common flow shape. Pinned by
+  `TestInteropFlowTelemetryMetadata`, which compares both runtimes on one Redis.
+- **The retry re-stamp is not ported.** `job.ts:741-752` writes the failure span's
+  context into the job's `tm` _hash field_, but every reader takes `tm` out of the
+  **opts JSON** (`redis-queue-backend.ts:2915-2935`; `raw2jobData` has no `raw.tm`), so
+  the value is never read back — in Node too, a retried job's next attempt continues
+  from the original producer span. The port skips the dead write rather than mirroring
+  it byte for byte.
+
 ## Connection & infrastructure
 
 | Feature                                         | Status        |

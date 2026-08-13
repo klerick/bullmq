@@ -271,14 +271,27 @@ func (j *Job) backoffMap() map[string]any {
 	return m
 }
 
-// moveToCompleted moves the job to the completed set with its return value.
+// spanJobAttrs are the attributes upstream puts on a job's lifecycle spans
+// (job.ts setSpanJobAttributes).
+func (j *Job) spanJobAttrs() map[string]any {
+	return map[string]any{"bullmq.job.name": j.Name, "bullmq.job.id": j.ID}
+}
+
+// moveToCompleted moves the job to the completed set with its return value. It
+// runs inside an INTERNAL "complete" span, as upstream does (job.ts:646); called
+// with the worker's process context, that span nests under the process span.
 func (j *Job) moveToCompleted(ctx context.Context, returnValue any, fo finishOpts, fetchNext bool) error {
-	if _, err := j.queue.scripts.moveToCompleted(ctx, j, returnValue, fo, fetchNext); err != nil {
-		return err
-	}
-	j.ReturnValue = returnValue
-	j.AttemptsMade++ // in-memory only; Redis atm is incremented by the Lua script
-	return nil
+	return j.queue.tel.trace(ctx, SpanKindInternal, "complete", func(ctx context.Context, span Span) error {
+		if span != nil {
+			span.SetAttributes(j.spanJobAttrs())
+		}
+		if _, err := j.queue.scripts.moveToCompleted(ctx, j, returnValue, fo, fetchNext); err != nil {
+			return err
+		}
+		j.ReturnValue = returnValue
+		j.AttemptsMade++ // in-memory only; Redis atm is incremented by the Lua script
+		return nil
+	})
 }
 
 // moveToFailed applies the full retry policy, mirroring python/TS Job.moveToFailed:
@@ -297,38 +310,47 @@ func (j *Job) moveToFailed(ctx context.Context, jobErr error, fo finishOpts, fet
 	var ue *UnrecoverableError
 	unrecoverable := errors.As(jobErr, &ue)
 
-	moveToFailed := false
+	// Decide the outcome before opening the span: its name is the outcome, exactly
+	// as upstream picks it up front (job.ts:733-736 + getSpanOperation).
+	retryDelay := int64(-1) // -1: no retry left, the job goes to failed
 	if (j.AttemptsMade+1) < j.Attempts && !j.discarded && !unrecoverable {
-		delay := calculateBackoff(j.backoffMap(), j.AttemptsMade+1)
+		retryDelay = calculateBackoff(j.backoffMap(), j.AttemptsMade+1)
 		// A non-builtin backoff type (calculateBackoff returns -1) defers to a
 		// registered custom strategy, if any.
-		if delay == -1 && j.queue.backoffStrategy != nil {
+		if retryDelay == -1 && j.queue.backoffStrategy != nil {
 			bt, _ := j.backoffMap()["type"].(string)
-			delay = j.queue.backoffStrategy(j.AttemptsMade+1, bt, jobErr, j)
+			retryDelay = j.queue.backoffStrategy(j.AttemptsMade+1, bt, jobErr, j)
 		}
-		switch {
-		case delay == -1:
-			moveToFailed = true
-		case delay > 0:
-			if err := j.queue.scripts.moveToDelayed(ctx, j.ID, nowMillis(), delay, fo.token, fields); err != nil {
+	}
+	op := "fail"
+	switch {
+	case retryDelay > 0:
+		op = "delay"
+	case retryDelay == 0:
+		op = "retry"
+	}
+
+	return j.queue.tel.trace(ctx, SpanKindInternal, op, func(ctx context.Context, span Span) error {
+		if span != nil {
+			span.SetAttributes(j.spanJobAttrs())
+		}
+		switch op {
+		case "delay":
+			if err := j.queue.scripts.moveToDelayed(ctx, j.ID, nowMillis(), retryDelay, fo.token, fields); err != nil {
 				return err
 			}
-		default:
+		case "retry":
 			if err := j.queue.scripts.retryJob(ctx, j.ID, j.optBool("lifo"), fo.token, fields); err != nil {
 				return err
 			}
+		default:
+			if _, err := j.queue.scripts.moveToFailedFinal(ctx, j, errMsg, fo, fetchNext, fields); err != nil {
+				return err
+			}
 		}
-	} else {
-		moveToFailed = true
-	}
-
-	if moveToFailed {
-		if _, err := j.queue.scripts.moveToFailedFinal(ctx, j, errMsg, fo, fetchNext, fields); err != nil {
-			return err
-		}
-	}
-	j.AttemptsMade++ // in-memory only
-	return nil
+		j.AttemptsMade++ // in-memory only
+		return nil
+	})
 }
 
 // MoveToWaitingChildrenOpts configures moveToWaitingChildren. Child, when set,
