@@ -6,4 +6,4 @@ package bullmq
 
 // Version is the Go port's own version. Ports are versioned independently of the
 // TypeScript package; this tracks the Go module, tagged as go/vX.Y.Z.
-const Version = "0.2.0"
+const Version = "0.3.0"
