@@ -261,6 +261,15 @@ func buildOptsMap(o *JobOptions, failurePolicy []parentFailureOption) map[string
 // optsMap returns the effective options map for packing/storing.
 func (j *Job) optsMap() map[string]any { return j.opts }
 
+// TelemetryMetadata returns the trace context the job carries (the stored `tm`
+// option), or "" when it was added without telemetry. This is exactly what a
+// worker extracts before opening its process span; it is exported because a
+// process reacting to a queue EVENT has no other way to continue the same trace —
+// the events stream carries no trace context (no Lua script writes `tm` into it).
+// Pass it to Telemetry.Extract to open spans inside the producer's trace.
+// See Queue.GetJobTelemetryMetadata for the cheap path when only the id is known.
+func (j *Job) TelemetryMetadata() string { return toStr(j.opts["tm"]) }
+
 func (j *Job) optBool(key string) bool {
 	b, _ := j.opts[key].(bool)
 	return b

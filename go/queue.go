@@ -2,6 +2,7 @@ package bullmq
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -85,6 +86,29 @@ func (q *Queue) GetJob(ctx context.Context, id string) (*Job, error) {
 		return nil, nil
 	}
 	return jobFromRaw(q, raw, id), nil
+}
+
+// GetJobTelemetryMetadata returns the trace context stored on a job (its `tm`
+// option), or "" when the job carries none or no longer exists — a job removed by
+// removeOnComplete/removeOnFail takes its trace context with it, and the caller
+// falls back to a new trace.
+//
+// It reads a single hash field instead of the whole job, which matters on the path
+// it exists for: reacting to a queue event, where the alternative (GetJob) would
+// pull data, stacktrace and returnvalue just to read one string.
+func (q *Queue) GetJobTelemetryMetadata(ctx context.Context, jobID string) (string, error) {
+	raw, err := q.conn.client.HGet(ctx, q.keys.JobKey(jobID), "opts").Result()
+	if err == redis.Nil {
+		return "", nil // job (or its opts) is gone
+	}
+	if err != nil {
+		return "", err
+	}
+	var opts map[string]any
+	if err := json.Unmarshal([]byte(raw), &opts); err != nil {
+		return "", err
+	}
+	return toStr(opts["tm"]), nil
 }
 
 // GetJobCounts returns the number of jobs in each given state, keyed by the state

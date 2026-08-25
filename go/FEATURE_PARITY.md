@@ -107,6 +107,23 @@ administrative internal spans around queue and worker lifecycle (`pause`, `resum
 `getNextJob`, `rateLimit`, `moveStalledJobsToWait`). They observe operations, not jobs,
 so a job's trace is unaffected.
 
+One deliberate **extension** beyond upstream: `Job.TelemetryMetadata()` and
+`Queue.GetJobTelemetryMetadata()` expose the trace context a job carries, so a process
+reacting to a queue **event** can continue the job's trace. Upstream has no equivalent
+and cannot grow one incidentally — `QueueEventsOptions` extends
+`Omit<QueueBaseOptions, 'telemetry'>`, so telemetry on a listener is a compile error
+there, and its own OTel instrumentation patches methods, never the EventEmitter
+callback that lives in user code. The need is real for flows: a parent killed by the
+`failParentOnFailure` cascade never reaches a processor, so the `failed` event is the
+only place an application learns the tree's outcome. The events stream carries no
+trace context (no Lua script writes `tm` into it), and changing that would fork the
+vendored scripts — hence resolving it from the job instead. `WithTelemetry` on
+`NewQueueEvents` stays accepted-but-ignored (Go's shared options cannot express
+upstream's exclusion); the listener opens no spans of its own, which
+`TestQueueEventsTelemetryOptionIsInert` pins. Limit: a job removed by
+`removeOnComplete`/`removeOnFail` takes its trace context with it, and the handler
+falls back to a new trace.
+
 Two deliberate deviations from upstream's telemetry, both verified against Node:
 
 - **Flow nodes without options still propagate.** `flow-producer.ts:394` guards the

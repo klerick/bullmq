@@ -116,6 +116,18 @@ for e := range events {
 _ = errs
 ```
 
+An event carries no trace context of its own, so a handler that should appear in the
+job's trace resolves it from the job and extracts it:
+
+```go
+tm, _ := q.GetJobTelemetryMetadata(ctx, e.JobID) // one HGET; "" if the job is gone
+ctx, span := tel.StartSpan(tel.Extract(ctx, tm), "listener.failed", bullmq.SpanKindConsumer)
+defer span.End()
+```
+
+`WithTelemetry` on `NewQueueEvents` is accepted but ignored — the listener opens no
+spans by itself, so only the events you actually handle cost a read.
+
 ## Status
 
 See [FEATURE_PARITY.md](./FEATURE_PARITY.md). The core is complete (Queue, Worker,

@@ -44,7 +44,8 @@ func (e QueueEvent) ReturnValue() string { return e.Fields["returnvalue"] }
 func (e QueueEvent) FailedReason() string { return e.Fields["failedReason"] }
 
 // QueueEvents listens to a queue's events stream (`{prefix}:{name}:events`) via a
-// dedicated blocking connection. Construct with the same options as Queue.
+// dedicated blocking connection. Construct with the same options as Queue, except
+// WithTelemetry, which is accepted but ignored (see NewQueueEvents).
 type QueueEvents struct {
 	conn         *connection
 	keys         QueueKeys
@@ -52,6 +53,15 @@ type QueueEvents struct {
 }
 
 // NewQueueEvents creates a listener for the named queue.
+//
+// WithTelemetry has no effect here: a listener opens no spans of its own. Upstream
+// makes that a compile error (QueueEventsOptions extends
+// Omit<QueueBaseOptions, 'telemetry'>); Go's shared options cannot express the
+// exclusion, so the option is accepted and ignored. An event carries no trace
+// context — nothing writes `tm` into the stream — so a handler that wants to join
+// the job's trace resolves it itself via Queue.GetJobTelemetryMetadata (or
+// Job.TelemetryMetadata) and extracts it. Keeping that policy in the caller means
+// only the events it actually handles cost a read.
 func NewQueueEvents(name string, opts ...Option) (*QueueEvents, error) {
 	if err := ValidateQueueName(name); err != nil {
 		return nil, err
