@@ -103,7 +103,9 @@ func TestFlowProducerAddNodeInjectsTM(t *testing.T) {
 		Children: []*FlowJob{{Name: "child", QueueName: "flow-child"}},
 	}
 	var cmds []*redis.Cmd
-	tree, err := fp.addNode(context.Background(), client.Pipeline(), &cmds, flow, nil)
+	ids := make(map[*FlowJob]string)
+	assignFlowIDs(flow, ids)
+	tree, err := fp.addNode(context.Background(), client.Pipeline(), &cmds, flow, nil, ids)
 	if err != nil {
 		t.Fatalf("addNode: %v", err)
 	}

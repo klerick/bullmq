@@ -3,6 +3,8 @@ package bullmq
 import (
 	"errors"
 	"fmt"
+
+	"github.com/redis/go-redis/v9"
 )
 
 // Sentinel errors. Callers match them with errors.Is.
@@ -20,6 +22,18 @@ var (
 	// job. Mirrors the ValueError raised by python/bullmq/job.py:73-77.
 	ErrExclusiveParentOptions = errors.New("bullmq: parent-failure options cannot be used together")
 )
+
+// isNoScriptErr reports whether err is Redis' "NOSCRIPT" — the script cache was
+// emptied by a restart, a failover or SCRIPT FLUSH.
+//
+// Prefix matching is deliberate. go-redis normalises the reply to redis.ErrNoScript
+// only on the plain eval path, where it inspects the error right after running the
+// command; a pipelined command has not run at that point, so the raw server error
+// arrives later, at Exec. redis.ErrNoScript is still matched first for the calls
+// that do go through that path.
+func isNoScriptErr(err error) bool {
+	return err != nil && (errors.Is(err, redis.ErrNoScript) || redis.HasErrorPrefix(err, "NOSCRIPT"))
+}
 
 // UnrecoverableError marks a failure that must not be retried. A processor can
 // return it to force the job straight to the failed set, bypassing backoff.

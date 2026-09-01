@@ -378,12 +378,42 @@ type BulkJob struct {
 func (q *Queue) AddBulk(ctx context.Context, specs []BulkJob) (_ []*Job, err error) {
 	ctx, span := q.tel.start(ctx, SpanKindProducer, "addBulk")
 	defer func() { span.finish(err) }()
-	if err := q.conn.LoadScripts(ctx); err != nil {
+
+	// Scripts must be loaded before a pipeline: there is no EVALSHA -> EVAL fallback
+	// inside one. The cache is shared with every other user of this connection, so
+	// this costs nothing while Redis still holds the scripts.
+	gen, err := q.conn.scriptCache.ensure(ctx)
+	if err != nil {
 		return nil, err
 	}
+
+	jobs, applied, err := q.addBulkOnce(ctx, specs)
+	if isNoScriptErr(err) {
+		// Redis lost the scripts. Reload them for everyone regardless — otherwise the
+		// cache would keep claiming they are there and every later call would fail
+		// the same way.
+		if rerr := q.conn.scriptCache.reload(ctx, gen); rerr != nil {
+			return nil, rerr
+		}
+		// Replay only when the failed pass wrote nothing. Unlike a flow, bulk jobs
+		// without an explicit id get theirs from Redis (INCR), so re-sending a pass
+		// that partly succeeded would enqueue those jobs a second time.
+		if applied == 0 {
+			jobs, _, err = q.addBulkOnce(ctx, specs)
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	return jobs, nil
+}
+
+// addBulkOnce runs one pipeline pass. applied counts the jobs Redis accepted,
+// which is what decides whether replaying the pass is safe.
+func (q *Queue) addBulkOnce(ctx context.Context, specs []BulkJob) (_ []*Job, applied int, err error) {
 	jobs := make([]*Job, len(specs))
 	cmds := make([]*redis.Cmd, len(specs))
-	_, err = q.conn.client.Pipelined(ctx, func(pipe redis.Pipeliner) error {
+	if _, err = q.conn.client.Pipelined(ctx, func(pipe redis.Pipeliner) error {
 		for i, spec := range specs {
 			job, e := newJob(q, spec.Name, spec.Data, spec.Opts)
 			if e != nil {
@@ -398,22 +428,30 @@ func (q *Queue) AddBulk(ctx context.Context, specs []BulkJob) (_ []*Job, err err
 			cmds[i] = cmd
 		}
 		return nil
-	})
-	if err != nil {
-		return nil, err
+	}); err != nil {
+		// A pipeline reports the first failing command; the rest may still have run,
+		// so count what got through before deciding anything.
+		for _, cmd := range cmds {
+			if cmd != nil && cmd.Err() == nil {
+				applied++
+			}
+		}
+		return nil, applied, err
 	}
+
 	for i, cmd := range cmds {
 		res, e := cmd.Result()
 		if e != nil {
-			return nil, e
+			return nil, applied, e
 		}
+		applied++
 		id, e := parseAddResult(res, jobs[i].ParentKey)
 		if e != nil {
-			return nil, e
+			return nil, applied, e
 		}
 		jobs[i].ID = id
 	}
-	return jobs, nil
+	return jobs, applied, nil
 }
 
 // ── Rate limiting & global controls ──────────────────────────────────────

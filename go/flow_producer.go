@@ -2,7 +2,6 @@ package bullmq
 
 import (
 	"context"
-	"sync"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -29,11 +28,9 @@ type JobNode struct {
 // after all of its children have completed (the cascade is handled Redis-side by
 // moveToFinished). Construct with the same options as Queue.
 type FlowProducer struct {
-	conn     *connection
-	prefix   string
-	tel      Telemetry
-	loadOnce sync.Once
-	loadErr  error
+	conn   *connection
+	prefix string
+	tel    Telemetry
 }
 
 // NewFlowProducer creates a flow producer.
@@ -52,45 +49,82 @@ func (fp *FlowProducer) telFor(queueName string) telemetryHelper {
 	return telemetryHelper{t: fp.tel, name: queueName}
 }
 
-// ensureLoaded pre-loads every script (SCRIPT LOAD) once, so EVALSHA succeeds
-// inside the MULTI pipeline where the NOSCRIPT fallback is unavailable.
-func (fp *FlowProducer) ensureLoaded(ctx context.Context) error {
-	fp.loadOnce.Do(func() { fp.loadErr = fp.conn.LoadScripts(ctx) })
-	return fp.loadErr
+// assignFlowIDs gives every node that has no explicit id one, up front. The ids
+// must be decided before the first attempt: a retry has to re-add the very same
+// jobs, which the add scripts recognise as duplicates (EXISTS on the job key)
+// instead of enqueueing a second copy. Generating them inside addNode would make
+// a retry produce a whole new tree. The caller's FlowJob is left untouched.
+func assignFlowIDs(node *FlowJob, ids map[*FlowJob]string) {
+	if node == nil {
+		return
+	}
+	if node.Opts == nil || node.Opts.JobID == "" {
+		ids[node] = genID()
+	}
+	for _, child := range node.Children {
+		assignFlowIDs(child, ids)
+	}
 }
 
 // Add inserts a whole flow tree in a single transaction and returns the job tree.
 func (fp *FlowProducer) Add(ctx context.Context, flow *FlowJob) (*JobNode, error) {
-	if err := fp.ensureLoaded(ctx); err != nil {
+	// The scripts must be in Redis before the transaction: inside MULTI, go-redis
+	// cannot fall back from EVALSHA to EVAL, because it checks the error while the
+	// command is still only queued.
+	gen, err := fp.conn.scriptCache.ensure(ctx)
+	if err != nil {
 		return nil, err
 	}
 
-	var tree *JobNode
-	err := fp.telFor(flow.QueueName).trace(ctx, SpanKindProducer, "addFlow", func(ctx context.Context, span Span) error {
+	ids := make(map[*FlowJob]string)
+	assignFlowIDs(flow, ids)
+
+	var out *JobNode
+	err = fp.telFor(flow.QueueName).trace(ctx, SpanKindProducer, "addFlow", func(ctx context.Context, span Span) error {
 		if span != nil {
 			span.SetAttributes(map[string]any{"bullmq.queue": flow.QueueName, "bullmq.flow.name": flow.Name})
 		}
-		var cmds []*redis.Cmd
-		_, err := fp.conn.client.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
-			var e error
-			tree, e = fp.addNode(ctx, pipe, &cmds, flow, nil)
+		tree, e := fp.addTree(ctx, flow, ids)
+		if !isNoScriptErr(e) {
+			out = tree
 			return e
-		})
-		if err != nil {
-			return err
 		}
-		// Surface any negative status code the scripts returned inside the pipeline.
-		for _, cmd := range cmds {
-			if res, err := cmd.Result(); err != nil {
-				return err
-			} else if code, ok := res.(int64); ok && code < 0 {
-				return finishedError(ScriptErrorCode(code), errorContext{command: "addJob"})
-			}
+		// Redis lost the script cache (restart, failover, SCRIPT FLUSH). Reload it
+		// once for every caller that noticed, then replay the transaction — with the
+		// same ids, so a partially applied attempt cannot become a second tree.
+		if rerr := fp.conn.scriptCache.reload(ctx, gen); rerr != nil {
+			return rerr
 		}
-		return nil
+		tree, e = fp.addTree(ctx, flow, ids)
+		out = tree
+		return e
 	})
 	if err != nil {
 		return nil, err
+	}
+	return out, nil
+}
+
+// addTree runs one attempt: the whole tree in a single MULTI.
+func (fp *FlowProducer) addTree(ctx context.Context, flow *FlowJob, ids map[*FlowJob]string) (*JobNode, error) {
+	var tree *JobNode
+	var cmds []*redis.Cmd
+	if _, err := fp.conn.client.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+		var e error
+		tree, e = fp.addNode(ctx, pipe, &cmds, flow, nil, ids)
+		return e
+	}); err != nil {
+		return nil, err
+	}
+	// Surface any negative status code the scripts returned inside the pipeline.
+	for _, cmd := range cmds {
+		res, err := cmd.Result()
+		if err != nil {
+			return nil, err
+		}
+		if code, ok := res.(int64); ok && code < 0 {
+			return nil, finishedError(ScriptErrorCode(code), errorContext{command: "addJob"})
+		}
 	}
 	return tree, nil
 }
@@ -98,7 +132,7 @@ func (fp *FlowProducer) Add(ctx context.Context, flow *FlowJob) (*JobNode, error
 // addNode recursively adds a node and its children, threading parentOpts downward.
 // Flow jobs get a generated id up-front so children can reference the parent before
 // the pipeline executes.
-func (fp *FlowProducer) addNode(ctx context.Context, pipe redis.Pipeliner, cmds *[]*redis.Cmd, node *FlowJob, parent *ParentOptions) (*JobNode, error) {
+func (fp *FlowProducer) addNode(ctx context.Context, pipe redis.Pipeliner, cmds *[]*redis.Cmd, node *FlowJob, parent *ParentOptions, ids map[*FlowJob]string) (*JobNode, error) {
 	prefix := node.Prefix
 	if prefix == "" {
 		prefix = fp.prefix
@@ -114,7 +148,7 @@ func (fp *FlowProducer) addNode(ctx context.Context, pipe redis.Pipeliner, cmds 
 		opts.Parent = parent
 	}
 	if opts.JobID == "" {
-		opts.JobID = genID()
+		opts.JobID = ids[node] // assigned once by Add, so a retry re-adds the same job
 	}
 
 	// One span per node, opened inside the parent node's span (and inside addFlow),
@@ -142,7 +176,7 @@ func (fp *FlowProducer) addNode(ctx context.Context, pipe redis.Pipeliner, cmds 
 			childParent := &ParentOptions{ID: job.ID, Queue: sc.keys.QualifiedName()}
 			children := make([]*JobNode, 0, len(node.Children))
 			for _, child := range node.Children {
-				cn, err := fp.addNode(ctx, pipe, cmds, child, childParent)
+				cn, err := fp.addNode(ctx, pipe, cmds, child, childParent, ids)
 				if err != nil {
 					return err
 				}
