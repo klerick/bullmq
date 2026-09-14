@@ -2,6 +2,7 @@ package bullmq
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -66,8 +67,43 @@ func assignFlowIDs(node *FlowJob, ids map[*FlowJob]string) {
 	}
 }
 
+// hasDeduplication reports whether the options ask for deduplication, through the
+// typed field or through Extra (long or short key), the way the parent-failure
+// options are read.
+func hasDeduplication(o *JobOptions) bool {
+	if o == nil {
+		return false
+	}
+	if o.Deduplication != nil {
+		return true
+	}
+	_, long := o.Extra["deduplication"]
+	_, short := o.Extra["de"]
+	return long || short
+}
+
+// checkDeduplicationPlacement refuses a deduplication id anywhere but the root.
+// See ErrDeduplicationNotOnRoot: a deduplicated child never joins its parent's
+// dependencies, so the tree would be stuck while the add reports success. Checked
+// before the transaction, so a rejected flow writes nothing at all.
+func checkDeduplicationPlacement(node *FlowJob) error {
+	for _, child := range node.Children {
+		if hasDeduplication(child.Opts) {
+			return fmt.Errorf("%w: %q in queue %q", ErrDeduplicationNotOnRoot, child.Name, child.QueueName)
+		}
+		if err := checkDeduplicationPlacement(child); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // Add inserts a whole flow tree in a single transaction and returns the job tree.
 func (fp *FlowProducer) Add(ctx context.Context, flow *FlowJob) (*JobNode, error) {
+	if err := checkDeduplicationPlacement(flow); err != nil {
+		return nil, err
+	}
+
 	// The scripts must be in Redis before the transaction: inside MULTI, go-redis
 	// cannot fall back from EVALSHA to EVAL, because it checks the error while the
 	// command is still only queued.
@@ -105,10 +141,20 @@ func (fp *FlowProducer) Add(ctx context.Context, flow *FlowJob) (*JobNode, error
 	return out, nil
 }
 
+// flowCmd is one queued add together with what it was asked to do, so the reply
+// can be judged against it: an add script echoes the id it was given, and any
+// other id means the job was deduplicated onto an existing one.
+type flowCmd struct {
+	cmd       *redis.Cmd
+	node      *JobNode
+	jobID     string // the id we assigned to this node
+	parentKey string // for the error message when the parent is genuinely missing
+}
+
 // addTree runs one attempt: the whole tree in a single MULTI.
 func (fp *FlowProducer) addTree(ctx context.Context, flow *FlowJob, ids map[*FlowJob]string) (*JobNode, error) {
 	var tree *JobNode
-	var cmds []*redis.Cmd
+	var cmds []*flowCmd
 	if _, err := fp.conn.client.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
 		var e error
 		tree, e = fp.addNode(ctx, pipe, &cmds, flow, nil, ids)
@@ -116,23 +162,56 @@ func (fp *FlowProducer) addTree(ctx context.Context, flow *FlowJob, ids map[*Flo
 	}); err != nil {
 		return nil, err
 	}
-	// Surface any negative status code the scripts returned inside the pipeline.
-	for _, cmd := range cmds {
-		res, err := cmd.Result()
-		if err != nil {
+
+	byNode := make(map[*JobNode]*flowCmd, len(cmds))
+	for _, rec := range cmds {
+		byNode[rec.node] = rec
+	}
+	return resolveFlowResults(tree, byNode)
+}
+
+// resolveFlowResults reads what the scripts returned and shapes the tree to match
+// what Redis actually holds.
+//
+// A deduplicated node returns the id of the job that already owns the key, having
+// stored nothing — so the id is corrected (upstream does this for the root only,
+// src/classes/flow-producer.ts:253-264; every node is corrected here because the
+// results are all on hand and a stale id is a stale id wherever it sits) and its
+// children are dropped: they were queued in the same MULTI against a parent key
+// that never came into existence, so each of them returned -5 and none was
+// created. Those -5s are the expected consequence of the short circuit; a -5 from
+// a node whose parent was not deduplicated is still a real error.
+func resolveFlowResults(node *JobNode, byNode map[*JobNode]*flowCmd) (*JobNode, error) {
+	rec := byNode[node]
+	if rec == nil {
+		return node, nil
+	}
+	res, err := rec.cmd.Result()
+	if err != nil {
+		return nil, err
+	}
+	if code, ok := res.(int64); ok && code < 0 {
+		return nil, finishedError(ScriptErrorCode(code), errorContext{
+			jobID: rec.jobID, parentKey: rec.parentKey, command: "addJob",
+		})
+	}
+	if id, ok := res.(string); ok && id != rec.jobID {
+		node.Job.ID = id
+		node.Children = nil
+		return node, nil
+	}
+	for _, child := range node.Children {
+		if _, err := resolveFlowResults(child, byNode); err != nil {
 			return nil, err
 		}
-		if code, ok := res.(int64); ok && code < 0 {
-			return nil, finishedError(ScriptErrorCode(code), errorContext{command: "addJob"})
-		}
 	}
-	return tree, nil
+	return node, nil
 }
 
 // addNode recursively adds a node and its children, threading parentOpts downward.
 // Flow jobs get a generated id up-front so children can reference the parent before
 // the pipeline executes.
-func (fp *FlowProducer) addNode(ctx context.Context, pipe redis.Pipeliner, cmds *[]*redis.Cmd, node *FlowJob, parent *ParentOptions, ids map[*FlowJob]string) (*JobNode, error) {
+func (fp *FlowProducer) addNode(ctx context.Context, pipe redis.Pipeliner, cmds *[]*flowCmd, node *FlowJob, parent *ParentOptions, ids map[*FlowJob]string) (*JobNode, error) {
 	prefix := node.Prefix
 	if prefix == "" {
 		prefix = fp.prefix
@@ -171,7 +250,8 @@ func (fp *FlowProducer) addNode(ctx context.Context, pipe redis.Pipeliner, cmds 
 			if err != nil {
 				return err
 			}
-			*cmds = append(*cmds, cmd)
+			out = &JobNode{Job: job}
+			*cmds = append(*cmds, &flowCmd{cmd: cmd, node: out, jobID: job.ID, parentKey: job.ParentKey})
 
 			childParent := &ParentOptions{ID: job.ID, Queue: sc.keys.QualifiedName()}
 			children := make([]*JobNode, 0, len(node.Children))
@@ -182,7 +262,7 @@ func (fp *FlowProducer) addNode(ctx context.Context, pipe redis.Pipeliner, cmds 
 				}
 				children = append(children, cn)
 			}
-			out = &JobNode{Job: job, Children: children}
+			out.Children = children
 			return nil
 		}
 
@@ -190,8 +270,8 @@ func (fp *FlowProducer) addNode(ctx context.Context, pipe redis.Pipeliner, cmds 
 		if err != nil {
 			return err
 		}
-		*cmds = append(*cmds, cmd)
 		out = &JobNode{Job: job}
+		*cmds = append(*cmds, &flowCmd{cmd: cmd, node: out, jobID: job.ID, parentKey: job.ParentKey})
 		return nil
 	})
 	if err != nil {

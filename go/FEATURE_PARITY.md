@@ -90,6 +90,17 @@ jobId ✅ · removeOnComplete/removeOnFail ✅ · deduplication ✅ · repeat/cr
 failParentOnFailure / removeDependencyOnFailure / ignoreDependencyOnFailure /
 continueParentOnFailure ✅ · keepLogs ✅ · sizeLimit ✅ · telemetry ✅ (trace propagation via tm)
 
+Deduplication inside a flow is supported **on the root only**, and a hit is reported
+honestly: `FlowProducer.Add` succeeds, returns the id of the job that already holds the
+key (upstream corrects the root id the same way, `flow-producer.ts:253-264`) and returns
+no children, because a deduplicated root stores nothing and the children queued behind it
+in the same MULTI are never created. Upstream instead leaves those children in the
+returned tree carrying ids that name nothing, since it only ever inspects the root's
+result. Deduplication on a node below the root is refused up front with
+`ErrDeduplicationNotOnRoot`: on a hit the add scripts return before linking the existing
+job into the new parent's dependencies, so the parent would wait forever on a child that
+never joins it while the add reports success (upstream has that hole).
+
 The four parent-failure options are mutually exclusive (as in python): enabling more
 than one on the same job returns `ErrExclusiveParentOptions`. With none of them set,
 a failed child keeps blocking its parent forever — the upstream default.

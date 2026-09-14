@@ -94,6 +94,12 @@ Opts: &bullmq.JobOptions{
 
 Enabling more than one returns `bullmq.ErrExclusiveParentOptions`.
 
+`Deduplication` works on the **root** of a flow: a second add of the same key succeeds and
+returns the existing root's id, with no children (nothing was created the second time).
+On any node below the root it is refused with `bullmq.ErrDeduplicationNotOnRoot` — a
+deduplicated child never joins its parent's dependencies, which would leave the parent
+waiting forever.
+
 ## Schedulers
 
 ```go

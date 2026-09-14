@@ -102,7 +102,7 @@ func TestFlowProducerAddNodeInjectsTM(t *testing.T) {
 		Name: "parent", QueueName: "flow-parent",
 		Children: []*FlowJob{{Name: "child", QueueName: "flow-child"}},
 	}
-	var cmds []*redis.Cmd
+	var cmds []*flowCmd
 	ids := make(map[*FlowJob]string)
 	assignFlowIDs(flow, ids)
 	tree, err := fp.addNode(context.Background(), client.Pipeline(), &cmds, flow, nil, ids)

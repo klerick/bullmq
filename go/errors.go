@@ -21,6 +21,14 @@ var (
 	// ignoreDependencyOnFailure, removeDependencyOnFailure) is enabled on the same
 	// job. Mirrors the ValueError raised by python/bullmq/job.py:73-77.
 	ErrExclusiveParentOptions = errors.New("bullmq: parent-failure options cannot be used together")
+
+	// ErrDeduplicationNotOnRoot is returned by FlowProducer.Add when a node other
+	// than the root carries a deduplication id. On a hit the Lua add scripts return
+	// the existing job's id before linking it into the new parent's dependencies,
+	// so the parent would be created and then wait on a child that never joins it —
+	// a tree stuck in waiting-children while the add reports success. Upstream has
+	// the same hole; the port refuses the case instead, before anything is written.
+	ErrDeduplicationNotOnRoot = errors.New("bullmq: deduplication is only supported on the root of a flow")
 )
 
 // isNoScriptErr reports whether err is Redis' "NOSCRIPT" — the script cache was
