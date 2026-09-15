@@ -94,11 +94,33 @@ Opts: &bullmq.JobOptions{
 
 Enabling more than one returns `bullmq.ErrExclusiveParentOptions`.
 
+Deduplication holds a key while a job with that id is around. What a second add does
+depends on the state of the holder:
+
+```go
+q.Add(ctx, "recalc", data, &bullmq.JobOptions{Deduplication: &bullmq.DeduplicationOptions{
+	ID:               "project:42",
+	KeepLastIfActive: true, // an add during processing is parked, not dropped
+	// TTL / Extend:  bound or refresh how long the key is held
+	// Replace:       swap the record of a holder that is still delayed
+}})
+```
+
+- holder **waiting** — the add collapses into it (that job has not read anything yet);
+- holder **active** — the add is dropped, _unless_ `KeepLastIfActive`, which parks the
+  payload and turns it into a job when the holder finishes. Only the newest parked payload
+  survives, so a key never has more than one active and one waiting job. Note the add
+  returns the **active** job's id; the parked payload runs under its own id, reported by
+  the `deduplicated` event as `deduplicatedJobId`;
+- holder **delayed** — `Replace` removes it and takes the key; without it the add
+  collapses. `Replace` cannot reach a job that already started.
+
 `Deduplication` works on the **root** of a flow: a second add of the same key succeeds and
 returns the existing root's id, with no children (nothing was created the second time).
 On any node below the root it is refused with `bullmq.ErrDeduplicationNotOnRoot` — a
 deduplicated child never joins its parent's dependencies, which would leave the parent
-waiting forever.
+waiting forever. `Replace` is refused anywhere in a flow with
+`bullmq.ErrDeduplicationReplaceInFlow`.
 
 ## Schedulers
 

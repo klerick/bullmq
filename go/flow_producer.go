@@ -82,16 +82,42 @@ func hasDeduplication(o *JobOptions) bool {
 	return long || short
 }
 
-// checkDeduplicationPlacement refuses a deduplication id anywhere but the root.
-// See ErrDeduplicationNotOnRoot: a deduplicated child never joins its parent's
-// dependencies, so the tree would be stuck while the add reports success. Checked
-// before the transaction, so a rejected flow writes nothing at all.
-func checkDeduplicationPlacement(node *FlowJob) error {
+// deduplicationReplace reports whether the options ask for the replace branch,
+// through the typed field or through Extra (long or short key).
+func deduplicationReplace(o *JobOptions) bool {
+	if o == nil {
+		return false
+	}
+	if o.Deduplication != nil && o.Deduplication.Replace {
+		return true
+	}
+	for _, key := range []string{"deduplication", "de"} {
+		if de, ok := o.Extra[key].(map[string]any); ok {
+			if b, _ := de["replace"].(bool); b {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// checkFlowDeduplication applies the two limits a flow puts on deduplication, both
+// before the transaction so a rejected flow writes nothing at all:
+//
+//   - only the root may carry a deduplication id (ErrDeduplicationNotOnRoot) — a
+//     deduplicated child never joins its parent's dependencies, leaving the tree
+//     stuck while the add reports success;
+//   - no node may ask for replace (ErrDeduplicationReplaceInFlow), which upstream
+//     types out of flows altogether.
+func checkFlowDeduplication(node *FlowJob) error {
+	if deduplicationReplace(node.Opts) {
+		return fmt.Errorf("%w: %q in queue %q", ErrDeduplicationReplaceInFlow, node.Name, node.QueueName)
+	}
 	for _, child := range node.Children {
 		if hasDeduplication(child.Opts) {
 			return fmt.Errorf("%w: %q in queue %q", ErrDeduplicationNotOnRoot, child.Name, child.QueueName)
 		}
-		if err := checkDeduplicationPlacement(child); err != nil {
+		if err := checkFlowDeduplication(child); err != nil {
 			return err
 		}
 	}
@@ -100,7 +126,7 @@ func checkDeduplicationPlacement(node *FlowJob) error {
 
 // Add inserts a whole flow tree in a single transaction and returns the job tree.
 func (fp *FlowProducer) Add(ctx context.Context, flow *FlowJob) (*JobNode, error) {
-	if err := checkDeduplicationPlacement(flow); err != nil {
+	if err := checkFlowDeduplication(flow); err != nil {
 		return nil, err
 	}
 

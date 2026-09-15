@@ -16,9 +16,39 @@ type ParentOptions struct {
 	Queue string
 }
 
-// DeduplicationOptions configures job de-duplication.
+// DeduplicationOptions configures job de-duplication. While the key is held, an
+// add with the same ID does not create a job; what happens to it depends on the
+// state of the holder and on these options. The fields mirror upstream's
+// DeduplicationOptions and are passed to the Lua scripts untouched — which branch
+// wins is the scripts' decision, not the port's.
 type DeduplicationOptions struct {
 	ID string
+
+	// TTL bounds how long the key is held, in milliseconds (default: until the job
+	// finishes). Ignored when KeepLastIfActive is set, as upstream documents.
+	TTL int64
+
+	// Extend refreshes the TTL on every deduplicated add instead of letting the
+	// original window run out.
+	Extend bool
+
+	// Replace swaps the record of a holder that is still delayed: the delayed job
+	// is removed and this one takes the key. A holder that has already started is
+	// out of reach, and the add falls back to the KeepLastIfActive branch — so on
+	// its own, Replace does not protect an update against a running job.
+	// Not available inside a flow (ErrDeduplicationReplaceInFlow).
+	Replace bool
+
+	// KeepLastIfActive parks an add that arrives while the holder is *active*, and
+	// turns it into a real job once that one finishes. Without it such an add is
+	// dropped: the running job may already have read its input, so the update would
+	// be reflected by no run at all. Only the newest parked payload is kept, giving
+	// at most two jobs per key — one active, one waiting.
+	//
+	// The add still returns the *active* job's id; the parked payload runs later
+	// under an id of its own, which is reported by the "deduplicated" event as
+	// deduplicatedJobId.
+	KeepLastIfActive bool
 }
 
 // JobOptions configures a job at add time. Zero values mean "unset" and fall back
@@ -201,6 +231,7 @@ func jobFromRaw(queue *Queue, raw map[string]string, jobID string) *Job {
 		AttemptsStarted: int(toInt64(raw["ats"])),
 		FailedReason:    raw["failedReason"],
 		DeferredFailure: raw["defa"],
+		DeduplicationID: raw["deid"],
 		ParentKey:       raw["parentKey"],
 		RepeatJobKey:    raw["rjk"],
 		opts:            opts,
@@ -244,7 +275,22 @@ func buildOptsMap(o *JobOptions, failurePolicy []parentFailureOption) map[string
 		opts["removeOnFail"] = o.RemoveOnFail
 	}
 	if o.Deduplication != nil {
-		opts["deduplication"] = map[string]any{"id": o.Deduplication.ID}
+		// Only what the caller set: an explicit zero is a different branch in the
+		// scripts than an absent field (ttl: 0 is not "no ttl").
+		de := map[string]any{"id": o.Deduplication.ID}
+		if o.Deduplication.TTL > 0 {
+			de["ttl"] = o.Deduplication.TTL
+		}
+		if o.Deduplication.Extend {
+			de["extend"] = true
+		}
+		if o.Deduplication.Replace {
+			de["replace"] = true
+		}
+		if o.Deduplication.KeepLastIfActive {
+			de["keepLastIfActive"] = true
+		}
+		opts["deduplication"] = de
 	}
 	if o.KeepLogs > 0 {
 		opts["keepLogs"] = o.KeepLogs

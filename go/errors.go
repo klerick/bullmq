@@ -29,6 +29,13 @@ var (
 	// a tree stuck in waiting-children while the add reports success. Upstream has
 	// the same hole; the port refuses the case instead, before anything is written.
 	ErrDeduplicationNotOnRoot = errors.New("bullmq: deduplication is only supported on the root of a flow")
+
+	// ErrDeduplicationReplaceInFlow is returned by FlowProducer.Add when a node asks
+	// for DeduplicationOptions.Replace. Replace swaps the delayed record of the job
+	// holding the key, which says nothing about the children queued behind it;
+	// upstream types the option out of flows entirely (FlowDeduplicationOptions =
+	// Omit<DeduplicationOptions, 'replace'>).
+	ErrDeduplicationReplaceInFlow = errors.New("bullmq: deduplication replace is not supported inside a flow")
 )
 
 // isNoScriptErr reports whether err is Redis' "NOSCRIPT" — the script cache was

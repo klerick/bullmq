@@ -90,6 +90,22 @@ jobId ✅ · removeOnComplete/removeOnFail ✅ · deduplication ✅ · repeat/cr
 failParentOnFailure / removeDependencyOnFailure / ignoreDependencyOnFailure /
 continueParentOnFailure ✅ · keepLogs ✅ · sizeLimit ✅ · telemetry ✅ (trace propagation via tm)
 
+All of upstream's deduplication options are modelled: `ID`, `TTL`, `Extend`, `Replace`,
+`KeepLastIfActive`. Which branch wins is left to the scripts — only the fields the caller
+set are sent, since an explicit zero is a different branch than an absent field. What
+happens to an add that hits a held key depends on the holder: **waiting** → it collapses
+into the queued job; **active** → it is dropped, unless `KeepLastIfActive` parks it and
+promotes it once the holder finishes (keeping only the newest payload, so at most two jobs
+per key exist); **delayed** → `Replace` swaps the record, and without it the add collapses.
+`Replace` alone therefore does _not_ protect an update against a running job — it reaches
+only a holder that has not started.
+
+One consequence worth knowing: an add parked by `KeepLastIfActive` returns the **active**
+job's id, while the parked payload later runs under an id of its own. That id is reported
+by the `deduplicated` event as `deduplicatedJobId` (available through `QueueEvent.Fields`),
+and `Job.DeduplicationID` is populated on jobs read back from Redis (upstream's
+`raw2jobData` does the same), so a worker knows which key it holds.
+
 Deduplication inside a flow is supported **on the root only**, and a hit is reported
 honestly: `FlowProducer.Add` succeeds, returns the id of the job that already holds the
 key (upstream corrects the root id the same way, `flow-producer.ts:253-264`) and returns
@@ -99,7 +115,9 @@ returned tree carrying ids that name nothing, since it only ever inspects the ro
 result. Deduplication on a node below the root is refused up front with
 `ErrDeduplicationNotOnRoot`: on a hit the add scripts return before linking the existing
 job into the new parent's dependencies, so the parent would wait forever on a child that
-never joins it while the add reports success (upstream has that hole).
+never joins it while the add reports success (upstream has that hole). `Replace` is refused
+anywhere in a flow with `ErrDeduplicationReplaceInFlow`, as upstream types it out
+(`FlowDeduplicationOptions = Omit<DeduplicationOptions, 'replace'>`).
 
 The four parent-failure options are mutually exclusive (as in python): enabling more
 than one on the same job returns `ErrExclusiveParentOptions`. With none of them set,
