@@ -7,6 +7,7 @@ import (
 	"errors"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -58,7 +59,9 @@ type Worker struct {
 	// worker.ts: stop retrying once closing).
 	closeOnce sync.Once
 	closeErr  error
-	closed    chan struct{}
+	closed    chan struct{} // shut by Close: stop fetching
+	runDone   chan struct{} // closed by Run on exit, so Close can await the drain
+	running   atomic.Bool   // whether Run was ever started
 
 	mu     sync.Mutex
 	active map[string]string // jobID -> lock token, for lock renewal
@@ -105,21 +108,27 @@ func NewWorker(name string, processor Processor, opts ...Option) (*Worker, error
 		drained:              true,
 		active:               make(map[string]string),
 		closed:               make(chan struct{}),
+		runDone:              make(chan struct{}),
 	}, nil
 }
 
 // Run processes jobs until ctx is cancelled. It blocks, so callers typically run
 // it in a goroutine. In-flight jobs are awaited before Run returns.
 func (w *Worker) Run(ctx context.Context) error {
-	// Close stops the loop through this derived context, which also aborts the
-	// blocking marker read instead of waiting out its timeout.
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	w.running.Store(true)
+	defer close(w.runDone) // lets Close wait for the drain below
+
+	// Close cancels fetching only: the context handed to processors stays the
+	// caller's, so jobs already running are awaited rather than aborted (upstream's
+	// non-forced close behaves the same). Cancelling the fetch context also aborts
+	// the blocking marker read instead of waiting out its timeout.
+	fetchCtx, stopFetch := context.WithCancel(ctx)
+	defer stopFetch()
 	go func() {
 		select {
 		case <-w.closed:
-			cancel()
-		case <-ctx.Done():
+			stopFetch()
+		case <-fetchCtx.Done():
 		}
 	}()
 
@@ -133,29 +142,29 @@ func (w *Worker) Run(ctx context.Context) error {
 	// Background maintenance: renew locks of active jobs, and recover stalled ones.
 	if !w.skipLockRenewal {
 		wg.Add(1)
-		go func() { defer wg.Done(); w.lockRenewalLoop(ctx) }()
+		go func() { defer wg.Done(); w.lockRenewalLoop(fetchCtx) }()
 	}
 	if !w.skipStalledCheck {
 		wg.Add(1)
-		go func() { defer wg.Done(); w.stalledCheckLoop(ctx) }()
+		go func() { defer wg.Done(); w.stalledCheckLoop(fetchCtx) }()
 	}
 
 	seq := 0
 
-	for ctx.Err() == nil {
+	for fetchCtx.Err() == nil {
 		select {
 		case sem <- struct{}{}:
-		case <-ctx.Done():
+		case <-fetchCtx.Done():
 			wg.Wait()
-			return ctx.Err()
+			return runExitErr(ctx)
 		}
 
 		seq++
 		token := w.id + ":" + strconv.Itoa(seq)
-		job, err := w.getNextJob(ctx, token)
+		job, err := w.getNextJob(fetchCtx, token)
 		if err != nil {
 			<-sem
-			if ctx.Err() != nil {
+			if fetchCtx.Err() != nil {
 				break
 			}
 			time.Sleep(100 * time.Millisecond) // bounded retry on transient error
@@ -175,7 +184,16 @@ func (w *Worker) Run(ctx context.Context) error {
 	}
 
 	wg.Wait()
-	return ctx.Err()
+	return runExitErr(ctx)
+}
+
+// runExitErr distinguishes the two ways the loop ends: a cancelled caller context
+// is reported as such, while a Close that left the context alive is a clean stop.
+func runExitErr(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return nil
 }
 
 // getNextJob returns the next job, blocking on the marker when the queue is drained.
@@ -396,18 +414,30 @@ func (w *Worker) ensureClientName(ctx context.Context) {
 	_ = w.queue.conn.client.Do(ctx, "CLIENT", "SETNAME", name).Err()
 }
 
-// Close stops using resources, closing only clients the worker owns.
-// Close stops the Run loop and releases the clients this worker owns. Run returns
-// context.Canceled shortly after.
+// Close stops fetching new jobs, waits for the ones already being processed to
+// finish, and only then releases the clients this worker owns (an injected client
+// is left to its owner). Run returns nil once the drain completes; a cancelled
+// caller context is still reported as such.
 //
-// Jobs already being processed are not awaited: their Redis calls may fail against
-// the closed client, leaving them active until the stalled check recovers them.
-// Cancel the context passed to Run and wait for it to return first if that matters.
+// Jobs in flight keep the context they were given, so they are awaited rather than
+// aborted — the same as upstream's non-forced close. A processor that neither
+// returns nor honours its context therefore holds Close for as long as it runs;
+// cancel the context passed to Run to abort such work instead. For the same reason
+// Close must not be called from inside a processor: it would wait for the very job
+// making the call.
+//
 // It is safe to call more than once — Close is often reached from both a defer and
 // a cleanup — and every call reports the result of the first.
 func (w *Worker) Close() error {
 	w.closeOnce.Do(func() {
 		close(w.closed)
+		// Drop the blocking peer first: it is parked on the marker for up to the
+		// drain delay, and cancelling a context does not interrupt a read already in
+		// flight. Jobs still running keep using the main client.
+		_ = w.queue.conn.closeBlocking()
+		if w.running.Load() {
+			<-w.runDone // jobs in flight finish against live clients
+		}
 		w.closeErr = w.queue.Close()
 	})
 	return w.closeErr

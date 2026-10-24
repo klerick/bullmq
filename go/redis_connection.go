@@ -24,6 +24,23 @@ type connection struct {
 	// is left alone so it keeps serving the DI container that created it.
 	ownsClient   bool
 	ownsBlocking bool
+
+	// The blocking peer is closed on its own when a worker shuts down, so both
+	// paths go through this.
+	closeBlockingOnce sync.Once
+	closeBlockingErr  error
+}
+
+// closeBlocking closes the blocking peer, which aborts a read parked on the marker
+// instead of leaving it to wait out its timeout. Only a peer we derived ourselves
+// is closed; an injected one belongs to its owner. Safe to call twice.
+func (c *connection) closeBlocking() error {
+	c.closeBlockingOnce.Do(func() {
+		if c.ownsBlocking && c.blockingClient != nil {
+			c.closeBlockingErr = c.blockingClient.Close()
+		}
+	})
+	return c.closeBlockingErr
 }
 
 // scriptCache remembers whether the Lua scripts are loaded in Redis. "Loaded" is
@@ -183,10 +200,8 @@ func (c *connection) sendScripts(ctx context.Context) error {
 // open for their owner (the DI container).
 func (c *connection) Close() error {
 	var firstErr error
-	if c.ownsBlocking && c.blockingClient != nil {
-		if err := c.blockingClient.Close(); err != nil {
-			firstErr = err
-		}
+	if err := c.closeBlocking(); err != nil {
+		firstErr = err
 	}
 	if c.ownsClient && c.client != nil {
 		if err := c.client.Close(); err != nil && firstErr == nil {
