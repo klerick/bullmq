@@ -5,18 +5,22 @@
     ":semanticCommits",
     ":enableVulnerabilityAlerts"
   ],
+  "timezone": "Europe/Madrid",
+  "minimumReleaseAge": "3 days",
+  "prConcurrentLimit": 5,
+  "prHourlyLimit": 2,
   "labels": ["dependencies"],
   "rangeStrategy": "pin",
   "lockFileMaintenance": {
     "enabled": true,
-    "schedule": ["before 9am"]
+    "schedule": ["before 9am on monday"]
   },
   "separateMajorMinor": true,
   "packageRules": [
     {
-      "description": "Run non-security dependency updates once per day by default",
+      "description": "Run non-security dependency updates once per week (Monday morning)",
       "matchPackageNames": ["*"],
-      "schedule": ["before 9am"]
+      "schedule": ["before 9am on monday"]
     },
     {
       "description": "Use chore commit type for all dev dependency updates",
@@ -61,18 +65,18 @@
       "commitMessageSuffix": "[python]"
     },
     {
-      "description": "Group every Python dev dependency update into a single PR",
+      "description": "Group every Python dependency update into a single PR",
       "matchCategories": ["python"],
-      "matchDepTypes": ["dev-dependencies"],
-      "groupName": "Python dev dependencies",
-      "groupSlug": "python-dev",
-      "commitMessageSuffix": "[python]",
-      "semanticCommitType": "chore"
+      "matchManagers": ["pep621"],
+      "groupName": "Python dependencies",
+      "groupSlug": "python",
+      "commitMessageSuffix": "[python]"
     },
     {
-      "description": "Use chore commit type for Python optional dev/test dependency updates",
+      "description": "Use chore commit type for Python optional dependency updates",
       "matchCategories": ["python"],
-      "matchDepTypes": ["dev", "test"],
+      "matchManagers": ["pep621"],
+      "matchDepTypes": ["project.optional-dependencies"],
       "semanticCommitType": "chore",
       "commitMessageSuffix": "[python]"
     },
@@ -242,9 +246,10 @@
       "allowedVersions": "<7"
     },
     {
-      "description": "🚨 Group all security vulnerabilities (OSV/GitHub alerts) into a single daily PR (overrides the per-runtime groups above)",
+      "description": "🚨 Group runtime security vulnerabilities (OSV/GitHub alerts) into a single daily PR (overrides the per-runtime groups above)",
+      "isVulnerabilityAlert": true,
       "matchUpdateTypes": ["major", "minor", "patch"],
-      "matchDepTypes": ["dependencies", "devDependencies"],
+      "matchDepTypes": ["dependencies"],
       "vulnerabilityFixVersion": true,
       "groupName": "security patches",
       "groupSlug": "security-patches",
@@ -254,8 +259,78 @@
       "schedule": ["before 9am"]
     },
     {
+      "description": "🚨 Group dev-only security vulnerabilities into a single daily PR and mark them as chores",
+      "isVulnerabilityAlert": true,
+      "matchUpdateTypes": ["major", "minor", "patch"],
+      "matchDepTypes": [
+        "devDependencies",
+        "require-dev",
+        "dev-dependencies",
+        "dev",
+        "test"
+      ],
+      "vulnerabilityFixVersion": true,
+      "groupName": "security dev patches",
+      "groupSlug": "security-dev-patches",
+      "prPriority": 100,
+      "labels": ["security", "osv"],
+      "commitMessageSuffix": "[SECURITY]",
+      "semanticCommitType": "chore",
+      "schedule": ["before 9am"]
+    },
+    {
       "description": "Do not pin peerDependencies, keep range strategy as-is",
       "matchDepTypes": ["peerDependencies"],
+      "rangeStrategy": "widen"
+    },
+    {
+      "description": "Never pin or bump `engines`: it is published to consumers (pinning engines.node to one exact version would block every user on other Node versions)",
+      "matchDepTypes": ["engines"],
+      "enabled": false
+    },
+    {
+      "description": "bullmq is a library: keep PHP runtime requirements as ranges (pinning them in composer.json `require` breaks consumers); widen instead of pinning",
+      "matchManagers": ["composer"],
+      "matchDepTypes": ["require"],
+      "rangeStrategy": "widen"
+    },
+    {
+      "description": "Never pin or bump the PHP platform requirement itself",
+      "matchManagers": ["composer"],
+      "matchPackageNames": ["php"],
+      "enabled": false
+    },
+    {
+      "description": "Cargo resolves ONE version per crate: crates pinned with `=` in both [dependencies] and [dev-dependencies] (e.g. tokio) must move in the same PR, so keep Rust dev-dependencies in the Rust groups",
+      "matchCategories": ["rust"],
+      "matchDepTypes": ["dev-dependencies"],
+      "groupName": "Rust dependencies",
+      "groupSlug": "rust"
+    },
+    {
+      "description": "Same for Rust majors",
+      "matchCategories": ["rust"],
+      "matchDepTypes": ["dev-dependencies"],
+      "matchUpdateTypes": ["major"],
+      "groupName": "Rust dependencies (major)",
+      "groupSlug": "rust-major"
+    },
+    {
+      "description": "🚨 Rust security fixes in ONE PR for both [dependencies] and [dev-dependencies] (overrides the runtime/dev security split above, which produced unresolvable Cargo.lock updates for tokio)",
+      "isVulnerabilityAlert": true,
+      "matchManagers": ["cargo"],
+      "groupName": "security patches [rust]",
+      "groupSlug": "security-patches-rust",
+      "prPriority": 100,
+      "labels": ["security", "osv"],
+      "commitMessageSuffix": "[SECURITY]",
+      "schedule": ["before 9am"]
+    },
+    {
+      "description": "Do not pin the redis-py runtime dependency of the Python library, keep its compatible range so consumers can resolve it alongside their own redis pin",
+      "matchManagers": ["pep621"],
+      "matchDepTypes": ["project.dependencies"],
+      "matchPackageNames": ["redis"],
       "rangeStrategy": "widen"
     }
   ],

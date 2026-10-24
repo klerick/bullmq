@@ -14,6 +14,8 @@ export default defineConfig({
       'tests/cluster.test.ts',
       'tests/connection.test.ts',
       'tests/sandboxed_process.test.ts',
+      'tests/worker.ioredis.test.ts',
+      'tests/relay.ioredis.test.ts',
 
       // Adapter-specific smoke tests (self-contained, not factory-based)
       'tests/node-redis.test.ts',

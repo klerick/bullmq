@@ -1,6 +1,6 @@
-use redis::aio::MultiplexedConnection;
+use redis::aio::ConnectionLike;
 use sha1::{Digest, Sha1};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::error::Error;
@@ -9,6 +9,7 @@ use crate::error::Error;
 #[derive(Debug, Clone)]
 pub struct LuaScript {
     /// The script name (e.g., "addStandardJob").
+    #[allow(dead_code)]
     pub name: String,
     /// Number of KEYS arguments the script expects.
     pub num_keys: usize,
@@ -31,9 +32,13 @@ impl LuaScript {
     }
 
     /// Execute this script via EVALSHA, falling back to EVAL on NOSCRIPT.
-    pub async fn execute(
+    ///
+    /// The NOSCRIPT fallback also covers reconnects: a restarted Redis has an
+    /// empty script cache, so the first EVALSHA after recovery transparently
+    /// re-loads the script via EVAL.
+    pub async fn execute<C: ConnectionLike>(
         &self,
-        conn: &mut MultiplexedConnection,
+        conn: &mut C,
         keys: &[impl redis::ToRedisArgs],
         args: &[impl redis::ToRedisArgs],
     ) -> Result<redis::Value, Error> {
@@ -71,7 +76,9 @@ impl LuaScript {
 
 /// Registry of all BullMQ Lua scripts.
 ///
-/// Scripts are loaded at startup and executed via EVALSHA for performance.
+/// Scripts execute via EVALSHA and lazily fall back to EVAL on NOSCRIPT.
+/// For pipelined operations where that fallback is not available, callers can
+/// ensure specific scripts are loaded ahead of time.
 #[derive(Debug, Clone)]
 pub struct ScriptRegistry {
     scripts: Arc<HashMap<String, LuaScript>>,
@@ -98,20 +105,24 @@ impl ScriptRegistry {
         self.scripts.get(name)
     }
 
-    /// Get all script names.
-    pub fn names(&self) -> Vec<&str> {
-        self.scripts.keys().map(|s| s.as_str()).collect()
-    }
-
-    /// Pre-load all scripts into Redis using SCRIPT LOAD.
+    /// Ensure the named scripts are loaded into Redis using SCRIPT LOAD.
     ///
-    /// This ensures EVALSHA calls will succeed (e.g., inside pipelines/MULTI
-    /// where NOSCRIPT fallback is not possible).
-    pub async fn load_all(
+    /// This is intended for pipelined operations where EVALSHA must succeed
+    /// without a NOSCRIPT -> EVAL fallback round trip.
+    pub async fn ensure_loaded<C: ConnectionLike>(
         &self,
-        conn: &mut MultiplexedConnection,
+        conn: &mut C,
+        names: &[&str],
     ) -> Result<(), crate::error::Error> {
-        for script in self.scripts.values() {
+        let mut seen = HashSet::new();
+        for name in names {
+            let Some(script) = self.scripts.get(*name) else {
+                continue;
+            };
+            if !seen.insert(script.sha.as_str()) {
+                continue;
+            }
+
             redis::cmd("SCRIPT")
                 .arg("LOAD")
                 .arg(script.content.as_str())
@@ -159,8 +170,8 @@ impl ScriptRegistry {
             ),
             (
                 "moveToDelayed",
-                12,
-                include_str!("commands/moveToDelayed-12.lua"),
+                11,
+                include_str!("commands/moveToDelayed-11.lua"),
             ),
             (
                 "moveToWaitingChildren",
@@ -254,8 +265,8 @@ impl ScriptRegistry {
             ("paginate", 1, include_str!("commands/paginate-1.lua")),
             (
                 "getCountsPerPriority",
-                4,
-                include_str!("commands/getCountsPerPriority-4.lua"),
+                2,
+                include_str!("commands/getCountsPerPriority-2.lua"),
             ),
             (
                 "getDependencyCounts",
@@ -265,8 +276,8 @@ impl ScriptRegistry {
             ("getMetrics", 2, include_str!("commands/getMetrics-2.lua")),
             (
                 "reprocessJob",
-                8,
-                include_str!("commands/reprocessJob-8.lua"),
+                9,
+                include_str!("commands/reprocessJob-9.lua"),
             ),
             (
                 "removeChildDependency",
@@ -312,5 +323,80 @@ mod tests {
     fn test_sha1_computation() {
         let sha = compute_sha1("return 1");
         assert_eq!(sha.len(), 40);
+    }
+
+    async fn test_conn() -> redis::aio::MultiplexedConnection {
+        let url =
+            std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+        let client = redis::Client::open(url).expect("valid REDIS_URL");
+        client
+            .get_multiplexed_async_connection()
+            .await
+            .expect("redis connection")
+    }
+
+    async fn script_exists(
+        conn: &mut redis::aio::MultiplexedConnection,
+        shas: &[&str],
+    ) -> Vec<bool> {
+        let mut cmd = redis::cmd("SCRIPT");
+        cmd.arg("EXISTS");
+        for sha in shas {
+            cmd.arg(*sha);
+        }
+        cmd.query_async(conn).await.expect("SCRIPT EXISTS")
+    }
+
+    #[tokio::test]
+    async fn test_execute_falls_back_to_eval_and_caches_script() {
+        let mut conn = test_conn().await;
+        redis::cmd("SCRIPT")
+            .arg("FLUSH")
+            .arg("SYNC")
+            .query_async::<()>(&mut conn)
+            .await
+            .expect("SCRIPT FLUSH");
+
+        let script = LuaScript::new("test", 0, "return 1");
+        let keys: Vec<String> = Vec::new();
+        let args: Vec<String> = Vec::new();
+
+        let result = script
+            .execute(&mut conn, &keys, &args)
+            .await
+            .expect("execute");
+
+        assert_eq!(result, redis::Value::Int(1));
+        assert_eq!(
+            script_exists(&mut conn, &[script.sha.as_str()]).await,
+            vec![true]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ensure_loaded_loads_only_requested_scripts() {
+        let mut conn = test_conn().await;
+        redis::cmd("SCRIPT")
+            .arg("FLUSH")
+            .arg("SYNC")
+            .query_async::<()>(&mut conn)
+            .await
+            .expect("SCRIPT FLUSH");
+
+        let registry = ScriptRegistry::new();
+        registry
+            .ensure_loaded(&mut conn, &["addStandardJob", "addStandardJob"])
+            .await
+            .expect("ensure_loaded");
+
+        let add_standard = registry.get("addStandardJob").expect("addStandardJob");
+        let add_parent = registry.get("addParentJob").expect("addParentJob");
+        let existing = script_exists(
+            &mut conn,
+            &[add_standard.sha.as_str(), add_parent.sha.as_str()],
+        )
+        .await;
+
+        assert_eq!(existing, vec![true, false]);
     }
 }

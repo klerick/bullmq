@@ -1670,7 +1670,110 @@ describe('flows', () => {
         await worker.close();
         await grandchildrenWorker.close();
         await queueEvents.close();
+        await cleanupQueue(childrenQueueName);
+        await cleanupQueue(grandchildrenQueueName);
       });
+    });
+  });
+
+  describe('when queue is rate limited and parents fail with deferred failures', () => {
+    it('should not affect rate limit configuration', async () => {
+      const childrenQueueName = `children-queue-${randomUUID()}`;
+
+      const flow = new FlowProducer({ connection, prefix });
+
+      const childrenQueue = new Queue(childrenQueueName, {
+        connection,
+        prefix,
+      });
+
+      const childrenWorker = new Worker(
+        childrenQueueName,
+        async () => {
+          throw new Error('fail');
+        },
+        {
+          connection,
+          prefix,
+        },
+      );
+
+      const worker = new Worker(
+        queueName,
+        async () => {
+          throw new Error('fail');
+        },
+        { connection, limiter: { max: 1, duration: 10000 }, prefix },
+      );
+
+      const queueEvents = new QueueEvents(queueName, {
+        connection,
+        prefix,
+      });
+      await queueEvents.waitUntilReady();
+      await childrenWorker.waitUntilReady();
+      await worker.waitUntilReady();
+
+      const startTime = Date.now();
+      await flow.addBulk([
+        {
+          name: 'parent-job',
+          data: { idx: 0, foo: 'bar' },
+          queueName,
+          children: [
+            {
+              name: 'child-job',
+              data: { idx: 0, foo: 'bar' },
+              queueName: childrenQueueName,
+              opts: {
+                failParentOnFailure: true,
+              },
+            },
+          ],
+          opts: { jobId: 'first' },
+        },
+        {
+          name: 'parent-job',
+          data: { idx: 1, foo: 'baz' },
+          queueName,
+          children: [
+            {
+              name: 'child-job',
+              data: { idx: 1, foo: 'baz' },
+              queueName: childrenQueueName,
+              opts: {
+                failParentOnFailure: true,
+              },
+            },
+          ],
+          opts: { jobId: 'second' },
+        },
+      ]);
+
+      const failed = new Promise<void>((resolve, reject) => {
+        queueEvents.on('failed', async ({ jobId, failedReason, prev }) => {
+          if (jobId === 'second') {
+            try {
+              expect(prev).toBe('active');
+              const ttl = await queue.getRateLimitTtl();
+              expect(ttl).toBe(-2);
+              expect(Date.now() - startTime).toBeLessThanOrEqual(5000);
+              resolve();
+            } catch (error) {
+              reject(error);
+            }
+          }
+        });
+      });
+
+      await failed;
+
+      await flow.close();
+      await worker.close();
+      await childrenWorker.close();
+      await childrenQueue.close();
+      await queueEvents.close();
+      await cleanupQueue(childrenQueueName);
     });
   });
 
@@ -6204,6 +6307,109 @@ describe('flows', () => {
         await flow.close();
         await childrenWorker.close();
         await parentWorker.close();
+        await cleanupQueue(parentQueueName);
+      });
+    });
+
+    describe('when retrying a failed child with ignoreDependencyOnFailure using queue.retryJobs', () => {
+      it('should move the child back to the parent dependencies', async () => {
+        const parentQueueName = `parent-queue-${randomUUID()}`;
+        const name = 'child-job';
+
+        const flow = new FlowProducer({ connection, prefix });
+        const tree = await flow.add({
+          name: 'parent-job',
+          queueName: parentQueueName,
+          data: {},
+          children: [
+            {
+              name,
+              data: { foo: 'bar' },
+              queueName,
+              opts: { ignoreDependencyOnFailure: true, attempts: 1 },
+            },
+          ],
+        });
+
+        const childrenWorker = new Worker(
+          queueName,
+          async () => {
+            throw new Error('error');
+          },
+          {
+            connection,
+            prefix,
+          },
+        );
+        const failing = new Promise<void>(resolve => {
+          childrenWorker.once('failed', () => resolve());
+        });
+
+        await childrenWorker.waitUntilReady();
+        await failing;
+        await childrenWorker.close();
+
+        await queue.retryJobs({ state: 'failed' });
+
+        const state = await tree.children![0].job.getState();
+        expect(state).toBe('waiting');
+
+        const { ignored, unprocessed } = await tree.job.getDependenciesCount({
+          ignored: true,
+          unprocessed: true,
+        });
+        expect(ignored).toBe(0);
+        expect(unprocessed).toBe(1);
+
+        await flow.close();
+        await cleanupQueue(parentQueueName);
+      });
+    });
+
+    describe('when retrying completed children using queue.retryJobs', () => {
+      it('should move the children back to the parent dependencies', async () => {
+        const parentQueueName = `parent-queue-${randomUUID()}`;
+        const name = 'child-job';
+
+        const flow = new FlowProducer({ connection, prefix });
+        const tree = await flow.add({
+          name: 'parent-job',
+          queueName: parentQueueName,
+          data: {},
+          children: [
+            { name, data: { idx: 0 }, queueName },
+            { name, data: { idx: 1 }, queueName },
+          ],
+        });
+
+        let completedCount = 0;
+        const childrenWorker = new Worker(queueName, async () => {}, {
+          connection,
+          prefix,
+        });
+        const completing = new Promise<void>(resolve => {
+          childrenWorker.on('completed', () => {
+            completedCount++;
+            if (completedCount === 2) {
+              resolve();
+            }
+          });
+        });
+
+        await childrenWorker.waitUntilReady();
+        await completing;
+        await childrenWorker.close();
+
+        await queue.retryJobs({ state: 'completed' });
+
+        const { processed, unprocessed } = await tree.job.getDependenciesCount({
+          processed: true,
+          unprocessed: true,
+        });
+        expect(processed).toBe(0);
+        expect(unprocessed).toBe(2);
+
+        await flow.close();
         await cleanupQueue(parentQueueName);
       });
     });

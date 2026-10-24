@@ -1154,8 +1154,7 @@ defmodule BullMQ.Scripts do
     # KEYS[8] stalled key
     # KEYS[9] wait key
     # KEYS[10] rate limiter key
-    # KEYS[11] paused key
-    # KEYS[12] pc priority counter
+    # KEYS[11] pc priority counter
     keys = [
       Keys.marker(ctx),
       Keys.active(ctx),
@@ -1167,7 +1166,6 @@ defmodule BullMQ.Scripts do
       Keys.stalled(ctx),
       Keys.wait(ctx),
       Keys.limiter(ctx),
-      Keys.paused(ctx),
       Keys.pc(ctx)
     ]
 
@@ -1390,27 +1388,39 @@ defmodule BullMQ.Scripts do
           script_result()
   def move_stalled_jobs_to_wait(conn, ctx, max_stalled_count, opts \\ []) do
     keys = [
+      # KEYS[1] stalled
       Keys.stalled(ctx),
+      # KEYS[2] wait
       Keys.wait(ctx),
+      # KEYS[3] active
       Keys.active(ctx),
-      Keys.failed(ctx),
+      # KEYS[4] stalled-check
       Keys.stalled_check(ctx),
+      # KEYS[5] meta
       Keys.meta(ctx),
+      # KEYS[6] paused
       Keys.paused(ctx),
+      # KEYS[7] marker
       Keys.marker(ctx),
+      # KEYS[8] event stream
       Keys.events(ctx),
+      # KEYS[9] repeat
       Keys.repeat(ctx)
     ]
 
     timestamp = Keyword.get(opts, :timestamp, System.system_time(:millisecond))
 
+    max_check_time = Keyword.get(opts, :stalled_interval, 30_000)
+
     args = [
-      # ARGV[1] prefix:queueName
-      Keys.key(ctx),
-      # ARGV[2] max stalled count
+      # ARGV[1] max stalled count
       max_stalled_count,
+      # ARGV[2] prefix:queueName: (trailing colon — used to build jobKey directly)
+      Keys.key_prefix(ctx),
       # ARGV[3] timestamp
-      timestamp
+      timestamp,
+      # ARGV[4] max check time
+      max_check_time
     ]
 
     execute(conn, :move_stalled_jobs_to_wait, keys, args)
@@ -1456,12 +1466,12 @@ defmodule BullMQ.Scripts do
       Keys.paused(ctx),
       Keys.meta(ctx),
       Keys.prioritized(ctx),
-      Keys.pc(ctx),
-      Keys.marker(ctx),
-      Keys.events(ctx)
+      Keys.events(ctx),
+      Keys.delayed(ctx),
+      Keys.marker(ctx)
     ]
 
-    args = [if(paused?, do: "paused", else: "resumed")]
+    args = [if(paused?, do: "paused", else: "resumed"), "1"]
 
     execute(conn, :pause, keys, args)
   end
@@ -1598,7 +1608,9 @@ defmodule BullMQ.Scripts do
 
     args = [job_id]
 
-    execute(conn, :get_state, keys, args)
+    script = if RedisConnection.can_lpos?(conn), do: :get_state_v2, else: :get_state
+
+    execute(conn, script, keys, args)
   end
 
   @doc """
@@ -1780,6 +1792,27 @@ defmodule BullMQ.Scripts do
   end
 
   @doc """
+  Gets job counts per priority.
+
+  Returns a list of counts, one per requested priority, in the same order as
+  the input list.  Priority 0 counts jobs in the wait list (non-prioritized
+  jobs); every other priority value counts jobs in the prioritized sorted set
+  within the corresponding score range.
+
+  ## Parameters
+    * `conn` - Redis connection
+    * `ctx` - Queue context from Keys.new/2
+    * `priorities` - List of priority values to count
+  """
+  @spec get_counts_per_priority(atom(), queue_context(), [integer()]) :: script_result()
+  def get_counts_per_priority(conn, ctx, priorities) do
+    keys = [Keys.wait(ctx), Keys.prioritized(ctx)]
+    args = priorities
+
+    execute(conn, :get_counts_per_priority, keys, args)
+  end
+
+  @doc """
   Checks if the queue is at its max limit.
   """
   @spec is_maxed(atom(), queue_context()) :: script_result()
@@ -1849,9 +1882,10 @@ defmodule BullMQ.Scripts do
       if(state == :failed, do: Keys.failed(ctx), else: Keys.completed(ctx)),
       Keys.wait(ctx),
       Keys.meta(ctx),
-      Keys.paused(ctx),
       Keys.active(ctx),
-      Keys.marker(ctx)
+      Keys.marker(ctx),
+      Keys.prioritized(ctx),
+      Keys.pc(ctx)
     ]
 
     args = [
@@ -2106,7 +2140,7 @@ defmodule BullMQ.Scripts do
       %{}
       |> maybe_add_opt("del", Map.get(job_opts, :delay) || Map.get(job_opts, "delay") || delay, 0)
       |> maybe_add_opt(
-        "pri",
+        "priority",
         Map.get(job_opts, :priority) || Map.get(job_opts, "priority") || priority,
         0
       )

@@ -448,7 +448,12 @@ public sealed class RedisBackend : IQueueBackend
     }
 
     public async Task<NextJobData?> MoveToDelayedAsync(
-        string jobId, long timestamp, long delay, string token = "0", bool fetchNext = false)
+        string jobId,
+        long timestamp,
+        long delay,
+        string token = "0",
+        bool fetchNext = false,
+        bool skipAttempt = false)
     {
         var keys = MapKeys("marker", "active", "prioritized", "delayed");
         var keyList = new List<RedisKey>(keys)
@@ -459,7 +464,6 @@ public sealed class RedisBackend : IQueueBackend
             _keys["stalled"],
             _keys["wait"],
             _keys["limiter"],
-            _keys["paused"],
             _keys["pc"],
         };
 
@@ -470,7 +474,7 @@ public sealed class RedisBackend : IQueueBackend
             jobId,
             token,
             delay,
-            "0", // skipAttempt
+            skipAttempt ? "1" : "0",
             string.Empty, // fieldsToUpdate placeholder
             fetchNext ? "1" : "0",
         };
@@ -573,9 +577,10 @@ public sealed class RedisBackend : IQueueBackend
             _keys[state],
             _keys["wait"],
             _keys["meta"],
-            _keys["paused"],
             _keys["active"],
             _keys["marker"],
+            _keys["prioritized"],
+            _keys["pc"],
         };
 
         var pushCmd = (job.Opts.Lifo ?? false) ? "RPUSH" : "LPUSH";
@@ -822,7 +827,7 @@ public sealed class RedisBackend : IQueueBackend
 
     public async Task<long[]> GetCountsPerPriorityAsync(IReadOnlyList<long> priorities)
     {
-        var keys = MapKeys("wait", "paused", "meta", "prioritized");
+        var keys = MapKeys("wait", "prioritized");
         var args = priorities.Select(p => (RedisValue)p).ToArray();
         var result = await _connection.EvalAsync("getCountsPerPriority", keys, args).ConfigureAwait(false);
         var arr = (RedisResult[]?)result ?? Array.Empty<RedisResult>();

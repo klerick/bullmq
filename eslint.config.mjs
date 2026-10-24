@@ -22,6 +22,8 @@ export default defineConfig([
   globalIgnores([
     '**/.DS_Store',
     '**/node_modules',
+    // Generated at build time by scripts/generateSqlScripts.js (inlined SQL).
+    'src/postgres/sql-scripts.ts',
     'dist',
     'elixir',
     'php/vendor',
@@ -38,7 +40,7 @@ export default defineConfig([
     '**/*.sln',
     '**/*.sw*',
     '**/temp',
-    '**/changelogs',
+    '**/changelogs/*.md',
     'docs/gitbook/api',
     'docs/gitbook/changelog.md',
     'docs/gitbook/bullmq-pro/changelog.md',

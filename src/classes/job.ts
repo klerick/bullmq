@@ -42,6 +42,16 @@ const logger = debuglog('bull');
 
 export const PRIORITY_LIMIT = 2 ** 21 - 1;
 
+interface JobQueue extends Omit<
+  MinimalQueue,
+  'opts' | 'on' | 'removeListener'
+> {
+  opts: Omit<WorkerOptions, 'connection'>;
+  // Fluent methods must return this connection-free view too.
+  on(...args: Parameters<MinimalQueue['on']>): this;
+  removeListener(...args: Parameters<MinimalQueue['removeListener']>): this;
+}
+
 /**
  * Job
  *
@@ -55,7 +65,8 @@ export class Job<
   DataType = any,
   ReturnType = any,
   NameType extends string = string,
-> implements MinimalJob<DataType, ReturnType, NameType> {
+  ProgressType extends JobProgress = JobProgress,
+> implements MinimalJob<DataType, ReturnType, NameType, ProgressType> {
   /**
    * It includes the prefix, the namespace separator :, and queue name.
    * @see {@link https://www.gnu.org/software/gawk/manual/html_node/Qualified-Names.html}
@@ -66,7 +77,7 @@ export class Job<
    * The progress a job has performed so far.
    * @defaultValue 0
    */
-  progress: JobProgress = 0;
+  progress: ProgressType = 0 as ProgressType;
 
   /**
    * The value returned by the processor when processing this job.
@@ -175,7 +186,7 @@ export class Job<
   protected backend: IQueueBackend;
 
   constructor(
-    protected queue: MinimalQueue,
+    protected queue: JobQueue,
     /**
      * The name of the Job
      */
@@ -251,7 +262,7 @@ export class Job<
    * @returns The created Job instance
    */
   static async create<T = any, R = any, N extends string = string>(
-    queue: MinimalQueue,
+    queue: JobQueue,
     name: N,
     data: T,
     opts?: JobsOptions,
@@ -279,7 +290,7 @@ export class Job<
    * @returns The created Job instances
    */
   static async createBulk<T = any, R = any, N extends string = string>(
-    queue: MinimalQueue,
+    queue: JobQueue,
     jobs: {
       name: N;
       data: T;
@@ -327,7 +338,7 @@ export class Job<
    * @returns A Job instance reconstructed from the JSON data
    */
   static fromJSON<T = any, R = any, N extends string = string>(
-    queue: MinimalQueue,
+    queue: JobQueue,
     json: JobJson,
     jobId?: string,
   ): Job<T, R, N> {
@@ -444,7 +455,7 @@ export class Job<
    * @returns
    */
   static async fromId<T = any, R = any, N extends string = string>(
-    queue: MinimalQueue,
+    queue: JobQueue,
     jobId: string,
   ): Promise<Job<T, R, N> | undefined> {
     // jobId can be undefined if moveJob returns undefined
@@ -468,7 +479,7 @@ export class Job<
    * @returns The total number of log entries for this job so far.
    */
   static addJobLog(
-    queue: MinimalQueue,
+    queue: JobQueue,
     jobId: string,
     logRow: string,
     keepLogs?: number,
@@ -539,7 +550,7 @@ export class Job<
    *
    * @param progress - number or object to be saved as progress.
    */
-  async updateProgress(progress: JobProgress): Promise<void> {
+  async updateProgress(progress: ProgressType): Promise<void> {
     this.progress = progress;
     await this.backend.updateProgress(this.id, progress);
     this.queue.emit('progress', this, progress);
@@ -693,12 +704,20 @@ export class Job<
   }
 
   private async shouldRetryJob(err: Error): Promise<[boolean, number]> {
+    const opts = this.queue.opts;
+    const isUnrecoverable =
+      err instanceof UnrecoverableError || err.name == 'UnrecoverableError';
+    // A job that has been started as many times as `maxStartedAttempts` allows
+    // must not be retried again, regardless of its remaining attempts.
+    const hasReachedMaxStartedAttempts =
+      !!opts.maxStartedAttempts &&
+      opts.maxStartedAttempts <= this.attemptsStarted;
+
     if (
       this.attemptsMade + 1 < this.opts.attempts &&
-      !(err instanceof UnrecoverableError || err.name == 'UnrecoverableError')
+      !isUnrecoverable &&
+      !hasReachedMaxStartedAttempts
     ) {
-      const opts = this.queue.opts as WorkerOptions;
-
       const delay = await Backoffs.calculate(
         <BackoffOptions>this.opts.backoff,
         this.attemptsMade + 1,
@@ -1095,8 +1114,8 @@ export class Job<
    * @param queueEvents - Instance of QueueEvents.
    * @param ttl - Time in milliseconds to wait for job to finish before timing out.
    */
-  async waitUntilFinished(
-    queueEvents: QueueEvents,
+  async waitUntilFinished<B extends IQueueBackend, C>(
+    queueEvents: QueueEvents<any, B, C>,
     ttl?: number,
   ): Promise<ReturnType> {
     await this.queue.waitUntilReady();

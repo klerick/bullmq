@@ -9,6 +9,7 @@ import {
 } from './minimal-job';
 import { ParentKeyOpts } from './parent';
 import { QueueBaseOptions } from './queue-options';
+import { ConnectionOptions } from './redis-options';
 import { RepeatableOptions } from './repeatable-options';
 import { RetryOptions } from './retry-options';
 import { StreamReadRaw } from './redis-streams';
@@ -105,6 +106,19 @@ export interface IQueueBackend {
    * blocking primitive. Used by workers to bound `waitForJob`.
    */
   readonly minimumBlockTimeout: number;
+
+  /**
+   * Largest meaningful block timeout (in seconds) supported by the backend's
+   * blocking primitive. Used by workers to bound `waitForJob` when there are
+   * delayed jobs pending.
+   *
+   * Optional so existing custom backends keep compiling; the worker falls back
+   * to the Redis-derived default (10s) when a backend does not specify one. A
+   * backend whose blocking primitive keeps the connection open and re-arms to
+   * the next due job (e.g. PostgreSQL `LISTEN`/`NOTIFY`) can return a much
+   * larger value so an idle worker stops re-polling.
+   */
+  readonly maximumBlockTimeout?: number;
 
   /**
    * Subscribes to normalized backend lifecycle events (`'ready'`, `'error'`,
@@ -773,14 +787,16 @@ export interface IQueueBackend {
  * datastore/connection. The default factory is the Redis one
  * (`createRedisBackend`).
  *
- * The factory is generic over the concrete backend type `B` it produces, so a
- * caller (or class) parameterized on `B` keeps the concrete typing end-to-end
- * (e.g. `getBackend()` returning the concrete adapter instead of the bare
- * interface).
+ * Constructors infer the backend and connection types from this factory.
+ * Use {@link withBackend} when also specifying job or event-result type arguments.
+ * Without a factory or explicit types, constructors retain their Redis defaults.
  */
-export type BackendFactory<B extends IQueueBackend = IQueueBackend> = (
+export type BackendFactory<
+  B extends IQueueBackend = IQueueBackend,
+  ConnectionOptionsType = ConnectionOptions,
+> = (
   name: string,
-  opts: QueueBaseOptions,
+  opts: QueueBaseOptions<ConnectionOptionsType>,
   options?: {
     /** The backend's main connection is itself blocking (e.g. QueueEvents). */
     blocking?: boolean;

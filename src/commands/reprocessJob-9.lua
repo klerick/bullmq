@@ -7,9 +7,10 @@
     KEYS[3] job state
     KEYS[4] wait key
     KEYS[5] meta
-    KEYS[6] paused key
-    KEYS[7] active key
-    KEYS[8] marker key
+    KEYS[6] active key
+    KEYS[7] marker key
+    KEYS[8] prioritized key
+    KEYS[9] priority counter key
 
     ARGV[1] job.id
     ARGV[2] (job.opts.lifo ? 'R' : 'L') + 'PUSH'
@@ -27,8 +28,10 @@ local rcall = redis.call;
 
 -- Includes
 --- @include "includes/addJobInTargetList"
+--- @include "includes/addJobWithPriority"
 --- @include "includes/getOrSetMaxEvents"
 --- @include "includes/isQueuePausedOrMaxed"
+--- @include "includes/moveChildBackToParentDependencies"
 
 local jobKey = KEYS[1]
 if rcall("EXISTS", jobKey) == 1 then
@@ -46,23 +49,17 @@ if rcall("EXISTS", jobKey) == 1 then
 
     rcall("HDEL", jobKey, "finishedOn", "processedOn", ARGV[3], unpack(attributesToRemove))
 
-    local isPausedOrMaxed = isQueuePausedOrMaxed(KEYS[5], KEYS[7])
-    addJobInTargetList(KEYS[4], KEYS[8], ARGV[2], isPausedOrMaxed, jobId)
+    local isPausedOrMaxed = isQueuePausedOrMaxed(KEYS[5], KEYS[6])
+    local priority = tonumber(rcall("HGET", jobKey, "priority")) or 0
 
-    local parentKey = rcall("HGET", jobKey, "parentKey")
-
-    if parentKey and rcall("EXISTS", parentKey) == 1 then
-      if ARGV[4] == "failed" then
-        if rcall("ZREM", parentKey .. ":unsuccessful", jobKey) == 1 or
-          rcall("HDEL", parentKey .. ":failed", jobKey) == 1 then
-          rcall("SADD", parentKey .. ":dependencies", jobKey)
-        end
-      else
-        if rcall("HDEL", parentKey .. ":processed", jobKey) == 1 then
-          rcall("SADD", parentKey .. ":dependencies", jobKey)
-        end
-      end
+    -- Standard or priority add
+    if priority == 0 then
+      addJobInTargetList(KEYS[4], KEYS[7], ARGV[2], isPausedOrMaxed, jobId)
+    else
+      addJobWithPriority(KEYS[7], KEYS[8], priority, jobId, KEYS[9], isPausedOrMaxed)
     end
+
+    moveChildBackToParentDependencies(jobKey, ARGV[4])
 
     local maxEvents = getOrSetMaxEvents(KEYS[5])
     -- Emit waiting event

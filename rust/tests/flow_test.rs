@@ -1004,7 +1004,7 @@ async fn should_add_meta_key_to_both_parents_and_children() {
 
 /// Helper to check if a queue has a meta key set.
 async fn check_meta_exists(queue: &Queue) -> bool {
-    let mut conn = queue.connection().conn();
+    let mut conn = queue.connection().managed_conn();
     let result: Option<String> = redis::cmd("HGET")
         .arg(queue.keys().meta())
         .arg("library")
@@ -4985,7 +4985,7 @@ async fn should_propagate_get_flow_dependency_errors() {
         "{}:dependencies",
         parent_queue.keys().job_key(original_tree.job.id())
     );
-    let mut conn = parent_queue.connection().conn();
+    let mut conn = parent_queue.connection().managed_conn();
     redis::cmd("DEL")
         .arg(&deps_key)
         .query_async::<()>(&mut conn)
@@ -5055,7 +5055,7 @@ async fn should_ignore_missing_child_jobs_when_loading_flow() {
         .job
         .id()
         .to_string();
-    let mut conn = child_queue.connection().conn();
+    let mut conn = child_queue.connection().managed_conn();
     redis::cmd("DEL")
         .arg(child_queue.keys().job_key(&child_id))
         .query_async::<()>(&mut conn)
@@ -5114,7 +5114,7 @@ async fn should_propagate_child_loading_errors_when_loading_flow() {
         .id()
         .to_string();
     let child_deps_key = format!("{}:dependencies", child_queue.keys().job_key(&child_id));
-    let mut conn = child_queue.connection().conn();
+    let mut conn = child_queue.connection().managed_conn();
     redis::cmd("DEL")
         .arg(&child_deps_key)
         .query_async::<()>(&mut conn)
@@ -5316,6 +5316,122 @@ async fn should_reject_colon_in_flow_queue_names() {
     );
 
     flow.close().await;
+}
+
+#[tokio::test]
+async fn flow_add_rejects_invalid_custom_job_ids() {
+    let prefix = "bf-test";
+    let flow = test_flow_producer(prefix).await;
+
+    let result = flow
+        .add(FlowJob {
+            name: "root-job".to_string(),
+            queue_name: test_queue_name(),
+            data: serde_json::json!({}),
+            opts: Some(JobOptions {
+                job_id: Some("100".to_string()),
+                ..Default::default()
+            }),
+            prefix: None,
+            children: None,
+        })
+        .await;
+    let err = result.unwrap_err();
+    assert!(
+        err.to_string().contains("Custom Id cannot be integers"),
+        "got: {}",
+        err
+    );
+
+    let result = flow
+        .add(FlowJob {
+            name: "root-job".to_string(),
+            queue_name: test_queue_name(),
+            data: serde_json::json!({}),
+            opts: None,
+            prefix: None,
+            children: Some(vec![FlowJob {
+                name: "child-job".to_string(),
+                queue_name: test_queue_name(),
+                data: serde_json::json!({}),
+                opts: Some(JobOptions {
+                    job_id: Some("42".to_string()),
+                    ..Default::default()
+                }),
+                prefix: None,
+                children: None,
+            }]),
+        })
+        .await;
+    let err = result.unwrap_err();
+    assert!(
+        err.to_string().contains("Custom Id cannot be integers"),
+        "got: {}",
+        err
+    );
+
+    flow.close().await;
+}
+
+#[tokio::test]
+async fn get_flow_returns_children_with_legacy_repeat_job_ids() {
+    // Legacy repeatable ids (`repeat:<schedulerId>:<millis>`) are the one custom
+    // id shape allowed to contain `:`. Prefixes and queue names never do, so the
+    // child key `{prefix}:{queue}:repeat:sched:1` must be split from the left or
+    // the child resolves to the wrong queue and is silently dropped.
+    let prefix = "bf-test";
+    let parent_queue_name = test_queue_name();
+    let child_queue_name = test_queue_name();
+    let parent_queue = test_queue_with_prefix(&parent_queue_name, prefix).await;
+    let child_queue = test_queue_with_prefix(&child_queue_name, prefix).await;
+
+    let child_job_id = "repeat:scheduler-id:1700000000000";
+    let flow = test_flow_producer(prefix).await;
+    let tree = flow
+        .add(FlowJob {
+            name: "root-job".to_string(),
+            queue_name: parent_queue_name.clone(),
+            data: serde_json::json!({}),
+            opts: None,
+            prefix: None,
+            children: Some(vec![FlowJob {
+                name: "child-job".to_string(),
+                queue_name: child_queue_name.clone(),
+                data: serde_json::json!({ "idx": 0 }),
+                opts: Some(JobOptions {
+                    job_id: Some(child_job_id.to_string()),
+                    ..Default::default()
+                }),
+                prefix: None,
+                children: None,
+            }]),
+        })
+        .await
+        .unwrap();
+
+    let fetched = flow
+        .get_flow(bullmq::GetFlowOptions {
+            id: tree.job.id().to_string(),
+            queue_name: parent_queue_name.clone(),
+            prefix: Some(prefix.to_string()),
+            depth: None,
+            max_children: None,
+        })
+        .await
+        .unwrap();
+
+    let children = fetched
+        .children
+        .as_ref()
+        .expect("child with legacy repeat id should be returned");
+    assert_eq!(children.len(), 1);
+    assert_eq!(children[0].job.id(), child_job_id);
+    assert_eq!(children[0].job.name(), "child-job");
+    assert_eq!(children[0].job.data(), &serde_json::json!({ "idx": 0 }));
+
+    flow.close().await;
+    cleanup_queue(&parent_queue).await;
+    cleanup_queue(&child_queue).await;
 }
 
 // ─── Remove tests ──────────────────────────────────────────────────────────────

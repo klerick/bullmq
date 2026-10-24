@@ -10,10 +10,11 @@ import {
   IQueueBackend,
   JobJson,
   LockManagerWorkerContext,
-  MinimalQueue,
   Span,
   WorkerOptions,
 } from '../interfaces';
+import { ConnectionOptions } from '../interfaces/redis-options';
+import type { DefaultQueueOptions } from '../types/default-queue-options';
 import { JobProgress, JobSchedulerJobOptions } from '../types';
 import { Processor } from '../types/processor';
 import {
@@ -22,6 +23,7 @@ import {
   forwardConnectionError,
   isNotConnectionError,
   randomUUID,
+  withDetachedContext,
 } from '../utils';
 import { QueueBase } from './queue-base';
 import { RedisQueueBackend } from './redis-queue-backend';
@@ -44,9 +46,11 @@ import {
   JobScheduler,
 } from './job-scheduler';
 import { LockManager } from './lock-manager';
+import type { NoInferType } from '../types/no-infer';
 
-// 10 seconds is the maximum time a BZPOPMIN can block.
-const maximumBlockTimeout = 10;
+// 10 seconds is the maximum time a BZPOPMIN can block, so it is the default
+// ceiling used when a backend does not delegate its own `maximumBlockTimeout`.
+const defaultMaximumBlockTimeout = 10;
 
 // note: sandboxed processors would also like to define concurrency per process
 // for better resource utilization.
@@ -55,13 +59,17 @@ export interface WorkerListener<
   DataType = any,
   ResultType = any,
   NameType extends string = string,
+  ProgressType extends JobProgress = JobProgress,
 > extends IoredisListener {
   /**
    * Listen to 'active' event.
    *
    * This event is triggered when a job enters the 'active' state.
    */
-  active: (job: Job<DataType, ResultType, NameType>, prev: string) => void;
+  active: (
+    job: Job<DataType, ResultType, NameType, ProgressType>,
+    prev: string,
+  ) => void;
 
   /**
    * Listen to 'closed' event.
@@ -83,7 +91,7 @@ export interface WorkerListener<
    * This event is triggered when a job has successfully completed.
    */
   completed: (
-    job: Job<DataType, ResultType, NameType>,
+    job: Job<DataType, ResultType, NameType, ProgressType>,
     result: ResultType,
     prev: string,
   ) => void;
@@ -112,7 +120,7 @@ export interface WorkerListener<
    * reaches the stalled limit and it is deleted by the removeOnFail option.
    */
   failed: (
-    job: Job<DataType, ResultType, NameType> | undefined,
+    job: Job<DataType, ResultType, NameType, ProgressType> | undefined,
     error: Error,
     prev: string,
   ) => void;
@@ -133,8 +141,8 @@ export interface WorkerListener<
    * world.
    */
   progress: (
-    job: Job<DataType, ResultType, NameType>,
-    progress: JobProgress,
+    job: Job<DataType, ResultType, NameType, ProgressType>,
+    progress: ProgressType,
   ) => void;
 
   /**
@@ -180,14 +188,24 @@ export interface WorkerListener<
  * As soon as the class is instantiated and a connection to Redis is established
  * it will start processing jobs.
  *
+ * @typeParam DataType - The type of the data that the job will process.
+ * @typeParam ResultType - The type of the result of the job.
+ * @typeParam NameType - The type of the name of the job.
+ * @typeParam B - The queue backend used by this worker.
+ * @typeParam ProgressType - The type of the job progress. Defaults to
+ * {@link JobProgress}. Must be JSON-serializable, as progress is persisted
+ * in the backend.
+ *
  */
 export class Worker<
   DataType = any,
   ResultType = any,
   NameType extends string = string,
   B extends IQueueBackend = RedisQueueBackend,
-> extends QueueBase<B> {
-  declare readonly opts: WorkerOptions;
+  ProgressType extends JobProgress = JobProgress,
+  ConnectionOptionsType = ConnectionOptions,
+> extends QueueBase<B, ConnectionOptionsType> {
+  declare readonly opts: WorkerOptions<ConnectionOptionsType>;
   readonly id: string;
 
   private abortDelayController: AbortController | null = null;
@@ -199,14 +217,29 @@ export class Worker<
   protected lockManager: LockManager;
   private processorAcceptsSignal = false;
 
-  private stalledCheckerRunning = false;
   private stalledCheckStopper?: () => void;
+  private stalledCheckerPromise?: Promise<void>;
+  // Bumped whenever the currently running stalled-checker loop should be
+  // abandoned (e.g. by `pause()`). The loop compares its own captured value
+  // against the live counter on every iteration and exits as soon as they
+  // diverge, without anyone having to await it.
+  private stalledCheckerGeneration = 0;
   private waiting: Promise<number> | null = null;
+  /**
+   * The fetches and jobs tracked by the running main loop, so that `resume()`
+   * can wake it up.
+   */
+  private mainLoopQueue: AsyncFifoQueue<void | Job<
+    DataType,
+    ResultType,
+    NameType,
+    ProgressType
+  >> | null = null;
 
-  protected _jobScheduler: JobScheduler;
+  protected _jobScheduler: JobScheduler<B, ConnectionOptionsType>;
 
   protected paused: boolean;
-  protected processFn: Processor<DataType, ResultType, NameType>;
+  protected processFn: Processor<DataType, ResultType, NameType, ProgressType>;
   protected running = false;
   protected mainLoopRunning: Promise<void> | null = null;
 
@@ -216,10 +249,54 @@ export class Worker<
 
   constructor(
     name: string,
-    processor?: string | URL | null | Processor<DataType, ResultType, NameType>,
-    opts?: WorkerOptions,
-    backendFactory?: BackendFactory<B>,
+    processor:
+      | string
+      | URL
+      | null
+      | Processor<DataType, ResultType, NameType, ProgressType>
+      | undefined,
+    opts: WorkerOptions<NoInferType<ConnectionOptionsType>>,
+    backendFactory: BackendFactory<B, ConnectionOptionsType>,
+  );
+  constructor(
+    name: string,
+    processor:
+      | string
+      | URL
+      | null
+      | Processor<DataType, ResultType, NameType, ProgressType>
+      | undefined,
+    opts: WorkerOptions<NoInferType<ConnectionOptionsType>>,
+    backendFactory?: undefined,
+  );
+  constructor(
+    name: string,
+    processor?:
+      | string
+      | URL
+      | null
+      | Processor<DataType, ResultType, NameType, ProgressType>,
+    ...args: DefaultQueueOptions<
+      B,
+      ConnectionOptionsType,
+      RedisQueueBackend,
+      WorkerOptions
+    >
+  );
+  constructor(
+    name: string,
+    processor?:
+      | string
+      | URL
+      | null
+      | Processor<DataType, ResultType, NameType, ProgressType>,
+    opts?: WorkerOptions<ConnectionOptionsType>,
+    backendFactory?: BackendFactory<B, ConnectionOptionsType>,
   ) {
+    if (!opts || opts.connection === undefined || opts.connection === null) {
+      throw new Error('Worker requires a connection');
+    }
+
     super(
       name,
       {
@@ -236,10 +313,6 @@ export class Worker<
       },
       backendFactory,
     );
-
-    if (!opts || !opts.connection) {
-      throw new Error('Worker requires a connection');
-    }
 
     if (
       typeof this.opts.maxStalledCount !== 'number' ||
@@ -401,39 +474,69 @@ export class Worker<
     return this.backend.extendLocks(jobIds, tokens, duration);
   }
 
-  emit<U extends keyof WorkerListener<DataType, ResultType, NameType>>(
+  emit<
+    U extends keyof WorkerListener<
+      DataType,
+      ResultType,
+      NameType,
+      ProgressType
+    >,
+  >(
     event: U,
-    ...args: Parameters<WorkerListener<DataType, ResultType, NameType>[U]>
+    ...args: Parameters<
+      WorkerListener<DataType, ResultType, NameType, ProgressType>[U]
+    >
   ): boolean {
     return super.emit(event, ...args);
   }
 
-  off<U extends keyof WorkerListener<DataType, ResultType, NameType>>(
+  off<
+    U extends keyof WorkerListener<
+      DataType,
+      ResultType,
+      NameType,
+      ProgressType
+    >,
+  >(
     eventName: U,
-    listener: WorkerListener<DataType, ResultType, NameType>[U],
+    listener: WorkerListener<DataType, ResultType, NameType, ProgressType>[U],
   ): this {
     super.off(eventName, listener);
     return this;
   }
 
-  on<U extends keyof WorkerListener<DataType, ResultType, NameType>>(
+  on<
+    U extends keyof WorkerListener<
+      DataType,
+      ResultType,
+      NameType,
+      ProgressType
+    >,
+  >(
     event: U,
-    listener: WorkerListener<DataType, ResultType, NameType>[U],
+    listener: WorkerListener<DataType, ResultType, NameType, ProgressType>[U],
   ): this {
     super.on(event, listener);
     return this;
   }
 
-  once<U extends keyof WorkerListener<DataType, ResultType, NameType>>(
+  once<
+    U extends keyof WorkerListener<
+      DataType,
+      ResultType,
+      NameType,
+      ProgressType
+    >,
+  >(
     event: U,
-    listener: WorkerListener<DataType, ResultType, NameType>[U],
+    listener: WorkerListener<DataType, ResultType, NameType, ProgressType>[U],
   ): this {
     super.once(event, listener);
     return this;
   }
 
   protected callProcessJob(
-    job: Job<DataType, ResultType, NameType>,
+    job: Job<DataType, ResultType, NameType, ProgressType>,
     token: string,
     signal?: AbortSignal,
   ): Promise<ResultType> {
@@ -443,11 +546,12 @@ export class Worker<
   protected createJob(
     data: JobJson,
     jobId: string,
-  ): Job<DataType, ResultType, NameType> {
-    return this.Job.fromJSON(this as MinimalQueue, data, jobId) as Job<
+  ): Job<DataType, ResultType, NameType, ProgressType> {
+    return this.Job.fromJSON(this, data, jobId) as Job<
       DataType,
       ResultType,
-      NameType
+      NameType,
+      ProgressType
     >;
   }
 
@@ -498,19 +602,21 @@ export class Worker<
     return this._concurrency;
   }
 
-  get jobScheduler(): Promise<JobScheduler> {
-    return new Promise<JobScheduler>(async resolve => {
-      if (!this._jobScheduler) {
-        // Share the worker's backend (same queue) with the scheduler.
-        this._jobScheduler = new JobScheduler(
-          this.name,
-          this.opts,
-          () => this.backend,
-        );
-        this._jobScheduler.on('error', this.emit.bind(this, 'error'));
-      }
-      resolve(this._jobScheduler);
-    });
+  get jobScheduler(): Promise<JobScheduler<B, ConnectionOptionsType>> {
+    return new Promise<JobScheduler<B, ConnectionOptionsType>>(
+      async resolve => {
+        if (!this._jobScheduler) {
+          // Share the worker's backend (same queue) with the scheduler.
+          this._jobScheduler = new JobScheduler<B, ConnectionOptionsType>(
+            this.name,
+            this.opts,
+            () => this.backend,
+          );
+          this._jobScheduler.on('error', this.emit.bind(this, 'error'));
+        }
+        resolve(this._jobScheduler);
+      },
+    );
   }
 
   async run() {
@@ -567,8 +673,10 @@ export class Worker<
     const asyncFifoQueue = new AsyncFifoQueue<void | Job<
       DataType,
       ResultType,
-      NameType
+      NameType,
+      ProgressType
     >>();
+    this.mainLoopQueue = asyncFifoQueue;
 
     let tokenPostfix = 0;
 
@@ -589,7 +697,8 @@ export class Worker<
         const fetchedJob = this.retryIfFailed<void | Job<
           DataType,
           ResultType,
-          NameType
+          NameType,
+          ProgressType
         >>(() => this._getNextJob(token, { block: true }), {
           delayInMs: this.opts.runRetryDelay,
           onlyEmitError: true,
@@ -619,7 +728,7 @@ export class Worker<
 
       // Since there can be undefined jobs in the queue (when a job fails or queue is empty)
       // we iterate until we find a job.
-      let job: Job<DataType, ResultType, NameType> | void;
+      let job: Job<DataType, ResultType, NameType, ProgressType> | void;
       do {
         job = await asyncFifoQueue.fetch();
       } while (!job && asyncFifoQueue.numQueued() > 0);
@@ -628,7 +737,7 @@ export class Worker<
         const token = job.token;
         asyncFifoQueue.add(
           this.processJob(
-            <Job<DataType, ResultType, NameType>>job,
+            <Job<DataType, ResultType, NameType, ProgressType>>job,
             token,
             () => asyncFifoQueue.numTotal() <= this._concurrency,
           ),
@@ -636,6 +745,10 @@ export class Worker<
       } else if (asyncFifoQueue.numQueued() === 0) {
         await this.waitForRateLimit();
       }
+    }
+
+    if (this.mainLoopQueue === asyncFifoQueue) {
+      this.mainLoopQueue = null;
     }
   }
 
@@ -647,7 +760,9 @@ export class Worker<
   async getNextJob(token: string, { block = true }: GetNextJobOptions = {}) {
     const nextJob = await this._getNextJob(token, { block });
 
-    return this.trace<Job<DataType, ResultType, NameType> | undefined>(
+    return this.trace<
+      Job<DataType, ResultType, NameType, ProgressType> | undefined
+    >(
       SpanKind.INTERNAL,
       'getNextJob',
       this.name,
@@ -669,7 +784,7 @@ export class Worker<
   private async _getNextJob(
     token: string,
     { block = true }: GetNextJobOptions = {},
-  ): Promise<Job<DataType, ResultType, NameType> | undefined> {
+  ): Promise<Job<DataType, ResultType, NameType, ProgressType> | undefined> {
     if (this.paused) {
       return;
     }
@@ -678,7 +793,7 @@ export class Worker<
       return;
     }
 
-    let job: Job<DataType, ResultType, NameType> | undefined;
+    let job: Job<DataType, ResultType, NameType, ProgressType> | undefined;
     if (this.drained && block && !this.limitUntil && !this.waiting) {
       this.waiting = this.waitForJob(this.blockUntil);
       try {
@@ -724,6 +839,10 @@ export class Worker<
     return this.backend.minimumBlockTimeout;
   }
 
+  get maximumBlockTimeout(): number {
+    return this.backend.maximumBlockTimeout ?? defaultMaximumBlockTimeout;
+  }
+
   private isRateLimited(): boolean {
     return this.limitUntil > Date.now();
   }
@@ -731,7 +850,7 @@ export class Worker<
   protected async moveToActive(
     token: string,
     name?: string,
-  ): Promise<Job<DataType, ResultType, NameType>> {
+  ): Promise<Job<DataType, ResultType, NameType, ProgressType>> {
     const [jobData, id, rateLimitDelay, delayUntil] =
       await this.backend.moveToActive(token, name);
     this.updateDelays(rateLimitDelay, delayUntil);
@@ -792,7 +911,7 @@ export class Worker<
   }
 
   protected getBlockTimeout(blockUntil: number): number {
-    const opts: WorkerOptions = <WorkerOptions>this.opts;
+    const opts = this.opts;
 
     // when there are delayed jobs
     if (blockUntil) {
@@ -803,10 +922,13 @@ export class Worker<
       } else if (blockDelay < this.minimumBlockTimeout * 1000) {
         return this.minimumBlockTimeout;
       } else {
-        // We restrict the maximum block timeout to 10 second to avoid
-        // blocking the connection for too long in the case of reconnections
-        // reference: https://github.com/taskforcesh/bullmq/issues/1658
-        return Math.min(blockDelay / 1000, maximumBlockTimeout);
+        // We restrict the maximum block timeout to avoid blocking the
+        // connection for too long in the case of reconnections. The ceiling is
+        // backend-specific: Redis caps it at 10s (a `BZPOPMIN` blocked longer
+        // risks issues on reconnection, see #1658), whereas a backend that
+        // keeps the connection open and re-arms to the next due job can allow a
+        // much larger value so an idle worker stops re-polling.
+        return Math.min(blockDelay / 1000, this.maximumBlockTimeout);
       }
     } else {
       return Math.max(opts.drainDelay, this.minimumBlockTimeout);
@@ -844,7 +966,7 @@ export class Worker<
     jobData?: JobJson,
     jobId?: string,
     token?: string,
-  ): Promise<Job<DataType, ResultType, NameType>> {
+  ): Promise<Job<DataType, ResultType, NameType, ProgressType>> {
     if (!jobData) {
       if (!this.drained) {
         this.emit('drained');
@@ -922,13 +1044,13 @@ export class Worker<
   }
 
   async processJob(
-    job: Job<DataType, ResultType, NameType>,
+    job: Job<DataType, ResultType, NameType, ProgressType>,
     token: string,
     fetchNextCallback = () => true,
-  ): Promise<void | Job<DataType, ResultType, NameType>> {
+  ): Promise<void | Job<DataType, ResultType, NameType, ProgressType>> {
     const srcPropagationMetadata = job.opts?.telemetry?.metadata;
 
-    return this.trace<void | Job<DataType, ResultType, NameType>>(
+    return this.trace<void | Job<DataType, ResultType, NameType, ProgressType>>(
       SpanKind.CONSUMER,
       'process',
       this.name,
@@ -954,7 +1076,8 @@ export class Worker<
             const failed = await this.retryIfFailed<void | Job<
               DataType,
               ResultType,
-              NameType
+              NameType,
+              ProgressType
             >>(
               () => {
                 this.lockManager.untrackJob(job.id);
@@ -981,7 +1104,8 @@ export class Worker<
           return await this.retryIfFailed<void | Job<
             DataType,
             ResultType,
-            NameType
+            NameType,
+            ProgressType
           >>(
             () => {
               this.lockManager.untrackJob(job.id);
@@ -999,7 +1123,8 @@ export class Worker<
           const failed = await this.retryIfFailed<void | Job<
             DataType,
             ResultType,
-            NameType
+            NameType,
+            ProgressType
           >>(
             () => {
               this.lockManager.untrackJob(job.id);
@@ -1030,7 +1155,7 @@ export class Worker<
   }
 
   private getUnrecoverableErrorMessage(
-    job: Job<DataType, ResultType, NameType>,
+    job: Job<DataType, ResultType, NameType, ProgressType>,
   ) {
     if (job.deferredFailure) {
       return job.deferredFailure;
@@ -1045,7 +1170,7 @@ export class Worker<
 
   protected async handleCompleted(
     result: ResultType,
-    job: Job<DataType, ResultType, NameType>,
+    job: Job<DataType, ResultType, NameType, ProgressType>,
     token: string,
     fetchNextCallback = () => true,
     span?: Span,
@@ -1077,7 +1202,7 @@ export class Worker<
 
   protected async handleFailed(
     err: Error,
-    job: Job<DataType, ResultType, NameType>,
+    job: Job<DataType, ResultType, NameType, ProgressType>,
     token: string,
     fetchNextCallback = () => true,
     span?: Span,
@@ -1131,6 +1256,12 @@ export class Worker<
    * Pauses the processing of this queue only for this worker.
    */
   async pause(doNotWaitActive?: boolean): Promise<void> {
+    // Kept in the caller's active context (not detached): a correctly
+    // implemented AsyncLocalStorage-based context manager isolates concurrent
+    // async chains, so a background stalled-checker tick (which detaches its
+    // own context; see `stalledChecker()`) cannot overwrite this span's
+    // context. Staying attached lets applications correlate `pause` with the
+    // request or operation that initiated it.
     await this.trace<void>(
       SpanKind.INTERNAL,
       'pause',
@@ -1147,6 +1278,14 @@ export class Worker<
           if (!doNotWaitActive) {
             await this.whenCurrentJobsFinished();
           }
+          // Invalidate the currently running stalled-checker loop and cancel
+          // its pending timer. This is intentionally fire-and-forget: the
+          // loop may be in the middle of an in-flight Redis call (which, on
+          // a connection error, retries with its own delay), so awaiting it
+          // here could block `pause()` for an unbounded amount of time. The
+          // loop itself checks the generation on every iteration and will
+          // exit on its own as soon as it next has a chance to.
+          this.stalledCheckerGeneration++;
           this.stalledCheckStopper?.();
           this.emit('paused');
         }
@@ -1161,6 +1300,11 @@ export class Worker<
   async resume(): Promise<void> {
     try {
       if (!this.running || this.paused) {
+        let restartStalledChecker = false;
+
+        // Kept in the caller's active context for the same reason as
+        // `pause()`: only the background stalled-checker loop needs to
+        // detach its own context, so it cannot leak into this span.
         await this.trace<void>(
           SpanKind.INTERNAL,
           'resume',
@@ -1180,11 +1324,21 @@ export class Worker<
             } else {
               // Main loop is still running (pause was called with doNotWaitActive=true).
               // Restart the stalled checker since pause() stopped it.
-              await this.startStalledCheckTimer();
+              restartStalledChecker = true;
+              // While paused, the main loop does not fetch new jobs and may only be
+              // waiting for the jobs that were already active. Wake it up so that it
+              // fetches again without waiting for those jobs to finish.
+              this.mainLoopQueue?.add(Promise.resolve());
             }
             this.emit('resumed');
           },
         );
+
+        // Started outside of the trace above so that the stalled checker loop
+        // does not inherit the (already ended) `resume` span as its parent.
+        if (restartStalledChecker) {
+          await this.startStalledCheckTimer();
+        }
       }
     } catch (error) {
       this.emit('error', error as Error);
@@ -1285,35 +1439,111 @@ export class Worker<
    * @see {@link https://docs.bullmq.io/patterns/manually-fetching-jobs}
    */
   async startStalledCheckTimer(): Promise<void> {
-    if (!this.opts.skipStalledCheck) {
-      if (!this.closing && !this.stalledCheckerRunning) {
-        await this.trace<void>(
-          SpanKind.INTERNAL,
-          'startStalledCheckTimer',
-          this.name,
-          async span => {
-            span?.setAttributes({
-              [TelemetryAttributes.WorkerId]: this.id,
-              [TelemetryAttributes.WorkerName]: this.opts.name,
-            });
-
-            this.stalledCheckerRunning = true;
-            this.stalledChecker()
-              .catch(err => {
-                this.emit('error', <Error>err);
-              })
-              .finally(() => {
-                this.stalledCheckerRunning = false;
-              });
-          },
-        );
-      }
+    if (this.opts.skipStalledCheck) {
+      return;
     }
+
+    if (this.closing) {
+      return;
+    }
+
+    // Claim a new generation for this loop synchronously (before the first
+    // await), so that two concurrent callers (e.g. the automatic `run()`
+    // startup racing a manual `startStalledCheckTimer()` call, or `resume()`
+    // racing a not-yet-finished old loop that `pause()` just invalidated)
+    // cannot both end up owning a checker loop: only the call that captures
+    // the latest generation value proceeds past the check below.
+    const generation = ++this.stalledCheckerGeneration;
+
+    // Capture whatever loop (if any) is still winding down. Bumping the
+    // generation above only makes it stop at its next checkpoint; it does
+    // not cancel an in-flight `moveStalledJobsToWait` call, so we must let it
+    // fully finish before starting a new loop, otherwise both loops could run
+    // concurrently and scan for stalled jobs at the same time. This is
+    // chained below rather than awaited here in the public call path: an
+    // in-flight Redis call can be stuck behind `checkConnectionError`'s retry
+    // delay (or a slow reconnect) well after the worker has been paused, and
+    // callers such as `resume()` must return promptly instead of blocking on
+    // it, exactly like the previous "reuse the still-running checker"
+    // behavior used to.
+    const previousStalledCheckerPromise = this.stalledCheckerPromise;
+
+    // Wake up the previous loop's pending interval timer (if any) so it can
+    // observe the new generation and exit promptly, instead of leaving it to
+    // wait out the remainder of its `stalledInterval` wait.
+    this.stalledCheckStopper?.();
+
+    await this.trace<void>(
+      SpanKind.INTERNAL,
+      'startStalledCheckTimer',
+      this.name,
+      async span => {
+        span?.setAttributes({
+          [TelemetryAttributes.WorkerId]: this.id,
+          [TelemetryAttributes.WorkerName]: this.opts.name,
+        });
+      },
+    );
+
+    // The trace above is asynchronous, so the worker may have been closed, or
+    // another call may have claimed a newer generation, while it was in
+    // flight.
+    if (this.closing || generation !== this.stalledCheckerGeneration) {
+      return;
+    }
+
+    // Chain the new loop to start only once the previous one has fully
+    // exited (its errors are already handled by its own `.catch` below, so
+    // swallow them here), guaranteeing the two never scan concurrently -
+    // without awaiting that settlement from this public method, so
+    // `startStalledCheckTimer()`/`resume()` return promptly regardless of how
+    // long the previous loop's in-flight Redis call takes to settle.
+    this.stalledCheckerPromise = (
+      previousStalledCheckerPromise?.catch((): void => undefined) ??
+      Promise.resolve()
+    )
+      .then(() => {
+        // The wait above can take a while (e.g. a connection error retry
+        // delay), during which the worker may have closed or yet another
+        // caller may have claimed a newer generation.
+        if (this.closing || generation !== this.stalledCheckerGeneration) {
+          return;
+        }
+
+        return withDetachedContext(this.opts.telemetry, () =>
+          this.stalledChecker(generation),
+        );
+      })
+      .catch(err => {
+        this.emit('error', <Error>err);
+      });
   }
 
-  private async stalledChecker() {
-    while (!(this.closing || this.paused)) {
+  private async stalledChecker(generation: number) {
+    // The entire loop (including its recurring interval timer) is started
+    // under a detached root context by the caller above. Context managers
+    // backed by `AsyncLocalStorage` associate every continuation created
+    // inside a callback with whatever context was active when that
+    // continuation was created; detaching only the individual Redis call on
+    // each tick would still leave the long-lived `setTimeout` chain (and
+    // therefore every subsequent tick) parented to the caller's ambient span
+    // for the worker's whole lifetime, since a later no-op detached callback
+    // cannot retroactively replace a store that AsyncLocalStorage already
+    // restored to the outer (caller) context once the initial detached call
+    // returned.
+    while (
+      !(this.closing || this.paused) &&
+      generation === this.stalledCheckerGeneration
+    ) {
       await this.checkConnectionError(() => this.moveStalledJobsToWait());
+
+      if (
+        this.closing ||
+        this.paused ||
+        generation !== this.stalledCheckerGeneration
+      ) {
+        break;
+      }
 
       await new Promise<void>(resolve => {
         const timeout = setTimeout(resolve, this.opts.stalledInterval);
@@ -1355,7 +1585,7 @@ export class Worker<
     },
   ): Promise<T> {
     let retry = 0;
-    const maxRetries = opts.maxRetries || Infinity;
+    const maxRetries = opts.maxRetries ?? Infinity;
 
     do {
       try {
@@ -1375,6 +1605,13 @@ export class Worker<
             throw err;
           }
         } else {
+          if (this.closing || this.closed) {
+            if (opts.onlyEmitError) {
+              return;
+            }
+            throw err;
+          }
+
           if (opts.delayInMs && !this.closing && !this.closed) {
             await this.delay(opts.delayInMs, this.abortDelayController);
           }
@@ -1413,7 +1650,7 @@ export class Worker<
   }
 
   private moveLimitedBackToWait(
-    job: Job<DataType, ResultType, NameType>,
+    job: Job<DataType, ResultType, NameType, ProgressType>,
     token: string,
   ) {
     return job.moveToWait(token);

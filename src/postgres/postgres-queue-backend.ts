@@ -24,7 +24,10 @@ import {
 } from '../types';
 import { KeysMap } from '../classes/queue-keys';
 import { finishedErrors } from '../classes/finished-errors';
-import { PostgresConnection } from './postgres-connection';
+import {
+  PostgresConnection,
+  PostgresConnectionOptions,
+} from './postgres-connection';
 import { PgNotification, PgListenClient, PgQueryResult } from './pg-types';
 import { loadCommandSql } from './sql-loader';
 /**
@@ -292,7 +295,7 @@ export class PostgresQueueBackend
   constructor(
     public connection: PostgresConnection,
     protected readonly queueName: string,
-    protected readonly opts: QueueBaseOptions,
+    protected readonly opts: QueueBaseOptions<PostgresConnectionOptions>,
     protected readonly ownsConnection = true,
     /**
      * When set, the name applied to this backend's dedicated connection (its
@@ -310,6 +313,19 @@ export class PostgresQueueBackend
       this.connection.on('error', err => this.emit('error', err));
       this.connection.on('ready', () => this.emit('ready'));
       this.connection.on('close', () => this.emit('close'));
+
+      // When the shared LISTEN client drops, the connection rebuilds it and
+      // emits `'listenerinvalidated'`. Re-issue our LISTENs on the fresh client
+      // and wake any in-flight wait (parked on the now-dead client) so the
+      // worker loop re-enters waitForJob/readEvents and re-subscribes. Only the
+      // connection-owning backend blocks (and thus LISTENs); non-owning
+      // `forQueue` siblings never do.
+      this.connection.on('listenerinvalidated', () => {
+        this.listening = false;
+        this.listeningEvents = false;
+        this.cancelWait?.();
+        this.cancelEventWait?.();
+      });
     }
   }
 
@@ -370,12 +386,11 @@ export class PostgresQueueBackend
     // PostgreSQL analogue of Redis `CLIENT SETNAME`. This is the long-lived
     // connection a worker / QueueEvents holds, so it appears (under this name)
     // in pg_stat_activity and is therefore discoverable by getWorkers /
-    // getQueueEvents via getClientList.
+    // getQueueEvents via getClientList. The connection remembers the name and
+    // re-applies it whenever it has to rebuild the LISTEN client (a fresh
+    // connection would otherwise start unnamed, i.e. undiscoverable).
     await this.connection.waitUntilReady();
-    const client = await this.connection.getListenClient();
-    await client.query(`SELECT set_config('application_name', $1, false)`, [
-      name,
-    ]);
+    await this.connection.setListenClientName(name);
   }
 
   /**
@@ -384,6 +399,24 @@ export class PostgresQueueBackend
    */
   get minimumBlockTimeout(): number {
     return 0.001;
+  }
+
+  /**
+   * PostgreSQL `LISTEN`/`NOTIFY` keeps the connection open and re-arms the wait
+   * to the next due delayed job, so there is no cheap-reconnect reason to cap
+   * the block at 10s like Redis. A large ceiling lets an idle worker go quiet
+   * instead of re-polling every 10s (important for serverless Postgres that
+   * suspends when idle). 3600s stays well under the 32-bit `setTimeout` ms
+   * ceiling (~24.8 days) that a larger delay would overflow.
+   *
+   * This relies on a dropped LISTEN connection being *detected* (TCP keepalive)
+   * and rebuilt; when keepalive could not be enabled — a user-supplied
+   * `pg.Pool` configured without it, whose checked-out client we could not
+   * adjust — a silent drop would go unnoticed for the whole block, so the
+   * ceiling stays at the conservative Redis-like 10s instead.
+   */
+  get maximumBlockTimeout(): number {
+    return this.connection.hasListenClientKeepAlive ? 3600 : 10;
   }
 
   forQueue(queueName: string, _prefix?: string): IQueueBackend {

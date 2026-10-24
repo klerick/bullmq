@@ -45,6 +45,8 @@ pub mod job_scheduler;
 pub mod keys;
 /// Configuration options for queues, workers, and jobs.
 pub mod options;
+/// Shared pagination parsing helpers for Lua `paginate` replies.
+mod paginate;
 /// Queue management and job submission.
 pub mod queue;
 /// Cross-process queue event listener (stream-based).
@@ -52,7 +54,7 @@ pub mod queue_events;
 /// Redis connection handling.
 pub mod redis_connection;
 /// Lua script registry and execution.
-pub mod scripts;
+mod scripts;
 /// Shared types: job state, progress, backoff strategies.
 pub mod types;
 /// Worker implementation for processing jobs...
@@ -71,8 +73,10 @@ pub use options::{
 };
 pub use queue::AddJob;
 pub use queue::BulkJob;
+pub use queue::DependencyItem;
 pub use queue::JobCountRecorder;
 pub use queue::Queue;
+pub use queue::QueueDependencies;
 pub use queue_events::{QueueEvent, QueueEventEntry, QueueEvents, QueueEventsOptions};
 pub use types::{
     DependenciesCount, DependenciesResult, JobProgress, JobState, Metrics, MetricsMeta, QueueMeta,

@@ -9,7 +9,7 @@ from bullmq.queue_keys import QueueKeys
 from bullmq.error_code import ErrorCode
 from bullmq.custom_errors import UnrecoverableError
 from bullmq.utils import isRedisVersionLowerThan, get_parent_key, object_to_flat_array
-from typing import Any, TYPE_CHECKING
+from typing import Any, Optional, TYPE_CHECKING
 if TYPE_CHECKING:
     from bullmq.job import Job
     from bullmq.redis_connection import RedisConnection
@@ -327,7 +327,6 @@ class Scripts:
         keys.append(self.keys['stalled'])
         keys.append(self.keys['wait'])
         keys.append(self.keys['limiter'])
-        keys.append(self.keys['paused'])
         keys.append(self.keys['pc'])
 
         fetch_next = opts.get("fetchNext", False)
@@ -402,7 +401,7 @@ class Scripts:
         template_opts: dict,
         scheduler_opts: dict,
         delayed_job_opts: dict,
-        producer_id: str = None,
+        producer_id: Optional[str] = None,
     ):
         """
         Register or override a job scheduler and queue its next iteration.
@@ -450,7 +449,7 @@ class Scripts:
         next_millis: int,
         template_data: str,
         delayed_job_opts: dict,
-        producer_id: str = None,
+        producer_id: Optional[str] = None,
     ):
         """
         Advance a registered job scheduler to its next iteration. Returns the
@@ -517,8 +516,6 @@ class Scripts:
 
     def getCountsPerPriorityArgs(self, priorities):
         keys = [self.keys['wait'],
-                self.keys['paused'],
-                self.keys['meta'],
                 self.keys['prioritized']]
 
         args = priorities
@@ -599,9 +596,10 @@ class Scripts:
         keys.append(self.keys[state])
         keys.append(self.keys['wait'])
         keys.append(self.keys['meta'])
-        keys.append(self.keys['paused'])
         keys.append(self.keys['active'])
         keys.append(self.keys['marker'])
+        keys.append(self.keys['prioritized'])
+        keys.append(self.keys['pc'])
 
         args = [
             job.id,
@@ -718,7 +716,11 @@ class Scripts:
 
     def moveToFinishedArgs(self, job: Job, val: Any, propVal: str, shouldRemove, target, token: str,
         fetchNext=True, fields_to_update = None) -> list[Any] | None:
-        transformed_value = json.dumps(val, separators=(',', ':'), allow_nan=False)
+        transformed_value = (
+            val
+            if propVal == 'failedReason'
+            else json.dumps(val, separators=(',', ':'), allow_nan=False)
+        )
         timestamp = round(time.time() * 1000)
         metricsKey = self.toKey('metrics:' + target)
 
@@ -803,7 +805,7 @@ class Scripts:
             return raw2NextJobData(result)
         return None
 
-    def extendLock(self, jobId: str, token: str, duration: int, client: Redis = None):
+    def extendLock(self, jobId: str, token: str, duration: int, client: Optional[Redis] = None):
         keys = [self.toKey(jobId) + ":lock", self.keys['stalled']]
         args = [token, duration, jobId]
         return self.commands["extendLock"](keys, args, client)
