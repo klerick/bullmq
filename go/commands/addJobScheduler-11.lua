@@ -241,7 +241,7 @@ local function getOrSetMaxEvents(metaKey)
   return maxEvents
 end
 --[[
-  Function to check for the meta.paused key to decide if we are paused or not
+  Function to check for the meta.paused attribute to decide if we are paused or not
   (since an empty list and !EXISTS are not really the same).
 ]]
 local function isQueuePaused(queueMetaKey)

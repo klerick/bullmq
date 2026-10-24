@@ -5,11 +5,19 @@ the same include-resolved Lua scripts (embedded from `rawScripts`), so a Go
 producer/consumer interoperates with any other BullMQ port. Interop is verified by
 cross-runtime tests against Node BullMQ (see `interop_test.go`, `cron_interop_test.go`).
 
-**Scripts are synced from upstream BullMQ v6** (6.0.10); interop tests run against
-`bullmq@6.0.10`. v6 dropped the separate `paused` list — pausing now only sets the
+**Scripts are synced from upstream BullMQ v6** (6.4.1); interop tests run against
+`bullmq@6.4.1`. v6 dropped the separate `paused` list — pausing now only sets the
 meta flag and deletes the marker, leaving jobs in `wait`. A queue shared with a
 pre-v6 runtime therefore disagrees about where paused jobs live; `Resume` migrates
 whatever a v5 runtime left in the legacy list back into `wait`.
+
+The 6.4 bump moved three scripts' key counts (`moveToDelayed` 12→11, `getCountsPerPriority`
+4→2, `reprocessJob` 8→9, all shedding the `paused` key v6 no longer has — `reprocessJob` also
+gained the prioritized set, which is how a retried job now keeps its priority). It also added
+14 `relay*` scripts for upstream's realtime-messaging feature: they are vendored like every
+other script (the embed takes the directory whole, and diverging from upstream's set costs more
+than 14 extra SCRIPT LOADs in one pipelined preload) but **no bindings exist** — realtime
+messaging is not ported.
 
 ## Legend
 

@@ -5,6 +5,6 @@
   "type": "module",
   "description": "Node BullMQ pinned to the rawScripts version (BullMQ v6), used by the Go port's cross-runtime interop tests.",
   "dependencies": {
-    "bullmq": "6.0.10"
+    "bullmq": "6.4.1"
   }
 }

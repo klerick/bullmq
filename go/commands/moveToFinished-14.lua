@@ -116,7 +116,6 @@ end
     eventStreamKey - event stream key
     rateLimiterKey - rate limiter key
     delayedKey - delayed sorted set key
-    pausedKey - paused list key
     metaKey - meta hash key
     pcKey - priority counter key
     markerKey - marker key
@@ -207,10 +206,13 @@ local function prepareJobForProcessing(keyPrefix, rateLimiterKey, eventStreamKey
   local jobKey = keyPrefix .. jobId
   -- Check if we need to perform rate limiting.
   if maxJobs then
-    local jobCounter = tonumber(rcall("INCR", rateLimiterKey))
-    if jobCounter == 1 then
-      local integerDuration = math.floor(math.abs(limiterDuration))
-      rcall("PEXPIRE", rateLimiterKey, integerDuration)
+    local isDeferredFailure = rcall("HEXISTS", jobKey, "defa") == 1
+    if not isDeferredFailure then
+      local jobCounter = tonumber(rcall("INCR", rateLimiterKey))
+      if jobCounter == 1 then
+        local integerDuration = math.floor(math.abs(limiterDuration))
+        rcall("PEXPIRE", rateLimiterKey, integerDuration)
+      end
     end
   end
   -- get a lock
@@ -290,7 +292,7 @@ local function promoteDelayedJobs(delayedKey, markerKey, targetKey, prioritizedK
     end
 end
 local function fetchNextJob(waitKey, activeKey, prioritizedKey, eventStreamKey,
-    rateLimiterKey, delayedKey, pausedKey, metaKey, pcKey, markerKey, prefix,
+    rateLimiterKey, delayedKey, metaKey, pcKey, markerKey, prefix,
     timestamp, opts)
     local isPausedOrMaxed, rateLimitMax, rateLimitDuration =
         getQueueMetadata(metaKey, activeKey, waitKey)
@@ -1011,7 +1013,7 @@ if rcall("EXISTS", jobIdKey) == 1 then -- Make sure job exists
     -- and not rate limited.
     if (ARGV[6] == "1") then
         local result = fetchNextJob(KEYS[1], KEYS[2], KEYS[3], eventStreamKey,
-            KEYS[6], KEYS[7], KEYS[8], metaKey, KEYS[10], KEYS[14], prefix,
+            KEYS[6], KEYS[7], metaKey, KEYS[10], KEYS[14], prefix,
             timestamp, opts)
         if result then
             return result

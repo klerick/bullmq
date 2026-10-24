@@ -115,10 +115,13 @@ local function prepareJobForProcessing(keyPrefix, rateLimiterKey, eventStreamKey
   local jobKey = keyPrefix .. jobId
   -- Check if we need to perform rate limiting.
   if maxJobs then
-    local jobCounter = tonumber(rcall("INCR", rateLimiterKey))
-    if jobCounter == 1 then
-      local integerDuration = math.floor(math.abs(limiterDuration))
-      rcall("PEXPIRE", rateLimiterKey, integerDuration)
+    local isDeferredFailure = rcall("HEXISTS", jobKey, "defa") == 1
+    if not isDeferredFailure then
+      local jobCounter = tonumber(rcall("INCR", rateLimiterKey))
+      if jobCounter == 1 then
+        local integerDuration = math.floor(math.abs(limiterDuration))
+        rcall("PEXPIRE", rateLimiterKey, integerDuration)
+      end
     end
   end
   -- get a lock

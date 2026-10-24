@@ -11,8 +11,7 @@
     KEYS[8] stalled key
     KEYS[9] wait key
     KEYS[10] rate limiter key
-    KEYS[11] paused key
-    KEYS[12] pc priority counter
+    KEYS[11] pc priority counter
     ARGV[1] key prefix
     ARGV[2] timestamp
     ARGV[3] the id of the job
@@ -66,7 +65,6 @@ end
     eventStreamKey - event stream key
     rateLimiterKey - rate limiter key
     delayedKey - delayed sorted set key
-    pausedKey - paused list key
     metaKey - meta hash key
     pcKey - priority counter key
     markerKey - marker key
@@ -145,10 +143,13 @@ local function prepareJobForProcessing(keyPrefix, rateLimiterKey, eventStreamKey
   local jobKey = keyPrefix .. jobId
   -- Check if we need to perform rate limiting.
   if maxJobs then
-    local jobCounter = tonumber(rcall("INCR", rateLimiterKey))
-    if jobCounter == 1 then
-      local integerDuration = math.floor(math.abs(limiterDuration))
-      rcall("PEXPIRE", rateLimiterKey, integerDuration)
+    local isDeferredFailure = rcall("HEXISTS", jobKey, "defa") == 1
+    if not isDeferredFailure then
+      local jobCounter = tonumber(rcall("INCR", rateLimiterKey))
+      if jobCounter == 1 then
+        local integerDuration = math.floor(math.abs(limiterDuration))
+        rcall("PEXPIRE", rateLimiterKey, integerDuration)
+      end
     end
   end
   -- get a lock
@@ -228,7 +229,7 @@ local function promoteDelayedJobs(delayedKey, markerKey, targetKey, prioritizedK
     end
 end
 local function fetchNextJob(waitKey, activeKey, prioritizedKey, eventStreamKey,
-    rateLimiterKey, delayedKey, pausedKey, metaKey, pcKey, markerKey, prefix,
+    rateLimiterKey, delayedKey, metaKey, pcKey, markerKey, prefix,
     timestamp, opts)
     local isPausedOrMaxed, rateLimitMax, rateLimitDuration =
         getQueueMetadata(metaKey, activeKey, waitKey)
@@ -374,7 +375,7 @@ if rcall("EXISTS", jobKey) == 1 then
     if (ARGV[8] == "1") then
         local opts = cmsgpack.unpack(ARGV[9])
         local result = fetchNextJob(KEYS[9], KEYS[2], KEYS[3], KEYS[6],
-            KEYS[10], KEYS[4], KEYS[11], metaKey, KEYS[12], markerKey,
+            KEYS[10], KEYS[4], metaKey, KEYS[11], markerKey,
             ARGV[1], ARGV[2], opts)
         if result and type(result[1]) == "table" then
             return result
