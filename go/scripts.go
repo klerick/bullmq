@@ -275,26 +275,37 @@ type finishOpts struct {
 }
 
 // moveToCompleted moves the job to the completed set with a JSON-encoded return value.
-func (s *scripts) moveToCompleted(ctx context.Context, job *Job, returnValue any, fo finishOpts, fetchNext bool) (any, error) {
+func (s *scripts) moveToCompleted(ctx context.Context, job *Job, returnValue any, fo finishOpts, fetchNext bool) (any, int64, error) {
 	valBytes, err := marshalJSON(returnValue)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	keys, args := s.moveToFinishedArgs(job, string(valBytes), "returnvalue", "completed", fo, fo.removeOnComplete, fetchNext, nil)
-	return s.runMoveToFinished(ctx, job.ID, keys, args)
+	keys, args, finishedOn := s.moveToFinishedArgs(job, string(valBytes), "returnvalue", "completed", fo, fo.removeOnComplete, fetchNext, nil)
+	res, err := s.runMoveToFinished(ctx, job.ID, keys, args)
+	if err != nil {
+		return nil, 0, err
+	}
+	return res, finishedOn, nil
 }
 
 // moveToFailedFinal moves the job to the failed set (no more retries). Unlike the
 // return value, failedReason is stored raw (not JSON-encoded), matching Node/rust.
-func (s *scripts) moveToFailedFinal(ctx context.Context, job *Job, failedReason string, fo finishOpts, fetchNext bool, fieldsToUpdate map[string]any) (any, error) {
-	keys, args := s.moveToFinishedArgs(job, failedReason, "failedReason", "failed", fo, fo.removeOnFail, fetchNext, fieldsToUpdate)
-	return s.runMoveToFinished(ctx, job.ID, keys, args)
+func (s *scripts) moveToFailedFinal(ctx context.Context, job *Job, failedReason string, fo finishOpts, fetchNext bool, fieldsToUpdate map[string]any) (any, int64, error) {
+	keys, args, finishedOn := s.moveToFinishedArgs(job, failedReason, "failedReason", "failed", fo, fo.removeOnFail, fetchNext, fieldsToUpdate)
+	res, err := s.runMoveToFinished(ctx, job.ID, keys, args)
+	if err != nil {
+		return nil, 0, err
+	}
+	return res, finishedOn, nil
 }
 
 // moveToFinishedArgs builds KEYS/ARGV for moveToFinished-14. Ported from python
 // scripts.py::moveToFinishedArgs. value is already transformed (JSON for completed,
 // raw for failed).
-func (s *scripts) moveToFinishedArgs(job *Job, value, propName, target string, fo finishOpts, shouldRemove any, fetchNext bool, fieldsToUpdate map[string]any) ([]string, []any) {
+// It also returns the timestamp it stamped the job with, which is the job's
+// finishedOn: upstream reads the very same value back out of the argument array
+// (redis-queue-backend.ts:2444) rather than asking Redis for it.
+func (s *scripts) moveToFinishedArgs(job *Job, value, propName, target string, fo finishOpts, shouldRemove any, fetchNext bool, fieldsToUpdate map[string]any) ([]string, []any, int64) {
 	keys := []string{
 		s.keys.Wait(), s.keys.Active(), s.keys.Prioritized(), s.keys.Events(),
 		s.keys.Stalled(), s.keys.Limiter(), s.keys.Delayed(), s.keys.Paused(),
@@ -318,12 +329,13 @@ func (s *scripts) moveToFinishedArgs(job *Job, value, propName, target string, f
 	if fetchNext {
 		fetchStr = "1"
 	}
-	args := []any{job.ID, nowMillis(), propName, value, target, fetchStr, s.keys.KeyPrefix(), packedOpts}
+	finishedOn := nowMillis()
+	args := []any{job.ID, finishedOn, propName, value, target, fetchStr, s.keys.KeyPrefix(), packedOpts}
 	if len(fieldsToUpdate) > 0 {
 		packedFields, _ := packMsgpack(objectToFlatArray(fieldsToUpdate))
 		args = append(args, packedFields)
 	}
-	return keys, args
+	return keys, args, finishedOn
 }
 
 func (s *scripts) runMoveToFinished(ctx context.Context, jobID string, keys []string, args []any) (any, error) {

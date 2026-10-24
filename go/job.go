@@ -158,6 +158,12 @@ type Job struct {
 	DeferredFailure string
 	ReturnValue     any
 	Progress        any
+	// ProcessedOn and FinishedOn are the job's own timestamps, in milliseconds.
+	// FinishedOn is the finality signal: it stays zero while an attempt failed but
+	// retries remain, and is set once the job has completed or failed for good
+	// (upstream sets it in the same two places — job.ts:682 and job.ts:816).
+	ProcessedOn int64
+	FinishedOn  int64
 
 	opts      map[string]any // effective options (long keys)
 	sizeLimit int
@@ -227,6 +233,8 @@ func jobFromRaw(queue *Queue, raw map[string]string, jobID string) *Job {
 		Timestamp:       toInt64(raw["timestamp"]),
 		Delay:           toInt64(raw["delay"]),
 		Priority:        int(toInt64(raw["priority"])),
+		ProcessedOn:     toInt64(raw["processedOn"]),
+		FinishedOn:      toInt64(raw["finishedOn"]),
 		Attempts:        int(toInt64(opts["attempts"])),
 		AttemptsStarted: int(toInt64(raw["ats"])),
 		FailedReason:    raw["failedReason"],
@@ -340,10 +348,12 @@ func (j *Job) moveToCompleted(ctx context.Context, returnValue any, fo finishOpt
 		if span != nil {
 			span.SetAttributes(j.spanJobAttrs())
 		}
-		if _, err := j.queue.scripts.moveToCompleted(ctx, j, returnValue, fo, fetchNext); err != nil {
+		_, finishedOn, err := j.queue.scripts.moveToCompleted(ctx, j, returnValue, fo, fetchNext)
+		if err != nil {
 			return err
 		}
 		j.ReturnValue = returnValue
+		j.FinishedOn = finishedOn
 		j.AttemptsMade++ // in-memory only; Redis atm is incremented by the Lua script
 		return nil
 	})
@@ -399,9 +409,14 @@ func (j *Job) moveToFailed(ctx context.Context, jobErr error, fo finishOpts, fet
 				return err
 			}
 		default:
-			if _, err := j.queue.scripts.moveToFailedFinal(ctx, j, errMsg, fo, fetchNext, fields); err != nil {
+			_, finishedOn, err := j.queue.scripts.moveToFailedFinal(ctx, j, errMsg, fo, fetchNext, fields)
+			if err != nil {
 				return err
 			}
+			// Only the terminal branch finishes the job: while a retry is pending
+			// FinishedOn stays zero, which is how a listener tells "will be retried"
+			// from "failed for good" (job.ts:816).
+			j.FinishedOn = finishedOn
 		}
 		j.AttemptsMade++ // in-memory only
 		return nil

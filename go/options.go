@@ -1,6 +1,10 @@
 package bullmq
 
-import "github.com/redis/go-redis/v9"
+import (
+	"context"
+
+	"github.com/redis/go-redis/v9"
+)
 
 // config holds the settings shared by Queue, Worker and FlowProducer. It is
 // populated through functional Options. Worker-only fields are ignored by Queue.
@@ -22,6 +26,55 @@ type config struct {
 	skipStalledCheck     bool
 	skipLockRenewal      bool
 	metricsMaxDataPoints int
+	listener             WorkerListener
+}
+
+// WorkerListener holds the callbacks a Worker invokes as its jobs move through
+// their lifecycle. Every field is optional. Named after upstream's WorkerListener
+// (src/classes/worker.ts:59), which carries the same events with the same arguments.
+//
+// A callback runs synchronously, in the goroutine of the job it belongs to, right
+// after the state change it reports. That is not a divergence: Node's
+// EventEmitter.emit calls its listeners inline, and so does python's
+// (python/bullmq/event_emitter.py). It is also what makes these callbacks usable
+// for side effects — Close drains the jobs in flight, so a handler is awaited
+// rather than cut off mid-way by a rollout. The flip side is that a slow handler
+// holds its concurrency slot and Close for as long as it runs, exactly like a slow
+// processor.
+//
+// Unlike QueueEvents, which reads a Redis stream, these fire in the process that
+// finalised the job: nothing is lost across a restart and nothing is delivered
+// twice when several workers share a queue.
+//
+// The context is the job's process context, so a handler can open a span nesting
+// under the job's 'process' span.
+//
+// A panic in a callback is recovered and reported to OnError instead of taking the
+// process down with it.
+type WorkerListener struct {
+	// OnActive reports a job entering the active state. prev is "waiting".
+	OnActive func(ctx context.Context, job *Job, prev string)
+
+	// OnCompleted reports a job that succeeded, with the processor's return value.
+	// prev is "active".
+	OnCompleted func(ctx context.Context, job *Job, result any, prev string)
+
+	// OnFailed reports an attempt that ended in an error — not necessarily the
+	// last one. It fires on every failed attempt, as upstream does, and
+	// Job.FinishedOn tells the two apart: zero while retries remain, set once the
+	// job has failed for good. prev is "active".
+	//
+	// It also fires for a parent failed by the failParentOnFailure cascade, whose
+	// processor never ran: err is then an *UnrecoverableError carrying the reason
+	// recorded by Lua.
+	OnFailed func(ctx context.Context, job *Job, err error, prev string)
+
+	// OnError reports an error of the worker itself rather than an outcome of a
+	// job: a finalisation that could not be written to Redis, a lock renewal or
+	// stalled check that failed, or a panic recovered from one of the callbacks
+	// above. job is nil when the error belongs to no particular job. Upstream's
+	// equivalent is emit('error') (worker.ts:1593).
+	OnError func(ctx context.Context, job *Job, err error)
 }
 
 // Limiter rate-limits a worker to Max jobs per Duration (milliseconds).
@@ -105,6 +158,13 @@ func WithSkipStalledCheck() Option {
 // WithSkipLockRenewal disables the worker's lock-renewal loop.
 func WithSkipLockRenewal() Option {
 	return func(cfg *config) { cfg.skipLockRenewal = true }
+}
+
+// WithWorkerListener registers lifecycle callbacks on a Worker. Set at
+// construction, so no listener can be added to a running worker and none needs a
+// lock. See WorkerListener for when each callback runs.
+func WithWorkerListener(l WorkerListener) Option {
+	return func(cfg *config) { cfg.listener = l }
 }
 
 // WithMetrics makes the worker record completed/failed job counts as a time series

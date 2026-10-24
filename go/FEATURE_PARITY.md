@@ -39,15 +39,15 @@ trigger to revisit.
 
 ## Classes
 
-| Class        | Status   | Notes                                                          |
-| ------------ | -------- | -------------------------------------------------------------- |
-| Queue        | ✅       | add, getters, counts, lifecycle, schedulers, rate limit, dedup |
-| Worker       | ✅       | concurrency, stalled detection, lock renewal, retry/backoff    |
-| Job          | ✅       | full lifecycle, flows, logs, progress, state                   |
-| FlowProducer | ✅       | parent/child trees with cascade                                |
-| JobScheduler | ✅       | interval (`Every`) and cron (`Pattern`); methods on `Queue`    |
-| QueueEvents  | ✅       | cross-process stream listener (`queue_events.go`)              |
-| Sandbox      | ❌ (N/A) | use native goroutines                                          |
+| Class        | Status   | Notes                                                                     |
+| ------------ | -------- | ------------------------------------------------------------------------- |
+| Queue        | ✅       | add, getters, counts, lifecycle, schedulers, rate limit, dedup            |
+| Worker       | ✅       | concurrency, stalled detection, lock renewal, retry/backoff, local events |
+| Job          | ✅       | full lifecycle, flows, logs, progress, state                              |
+| FlowProducer | ✅       | parent/child trees with cascade                                           |
+| JobScheduler | ✅       | interval (`Every`) and cron (`Pattern`); methods on `Queue`               |
+| QueueEvents  | ✅       | cross-process stream listener (`queue_events.go`)                         |
+| Sandbox      | ❌ (N/A) | use native goroutines                                                     |
 
 ---
 
@@ -85,10 +85,50 @@ trigger to revisit.
 | WorkerName / SkipStalledCheck / SkipLockRenewal   | ✅       |
 | Job scheduler next-iteration production           | ✅       |
 | Deferred failure (failParentOnFailure cascade)    | ✅       |
-| Events (via QueueEvents)                          | ✅       |
+| Local lifecycle events (WithWorkerListener)       | ✅       |
+| Cross-process events (via QueueEvents)            | ✅       |
 | Telemetry / OpenTelemetry (via bullmq/otel)       | ✅       |
 | Custom backoff strategies (WithBackoffStrategy)   | ✅       |
 | Sandboxed processors                              | ❌ (N/A) |
+
+### Worker events
+
+`WithWorkerListener(WorkerListener{...})` ports upstream's `WorkerListener`
+(`worker.ts:59`) as a struct of optional callbacks: `OnActive`, `OnCompleted`,
+`OnFailed`, `OnError`, with upstream's arguments plus a leading `context.Context`
+(the job's process context, so a handler can nest a span under `process`). They are
+local to the process that finalised the job — unlike `QueueEvents`, nothing is lost
+across a restart and nothing is delivered twice when several workers share a queue.
+
+A callback runs synchronously in the job's goroutine, which matches Node
+(`EventEmitter.emit` calls listeners inline) and python
+(`python/bullmq/event_emitter.py`); rust is the outlier, pushing a `WorkerEvent` enum
+into an unbounded channel. Because it is inline, `Close`'s drain awaits it, which is
+what makes the callbacks usable for side effects during a rollout.
+
+`OnFailed` fires on **every** failed attempt, as upstream does; `Job.FinishedOn`
+separates the final failure from the ones before it (it is set only in
+`moveToFailed`'s non-retry branch, `job.ts:816`).
+
+Three deliberate choices, none of them wire-visible:
+
+- **`active` is reported from the job's goroutine**, not from the fetch path where
+  upstream emits it (`worker.ts:1040`). A listener runs inline, and inline in the
+  fetch loop one slow handler would stall fetching for every other job. The state
+  reported is identical.
+- **A panic in a callback is recovered** and reported to `OnError` instead of taking
+  the process down. Go has no equivalent of a thrown-away rejected promise, and a
+  consumer's side-effect handler has no business crashing a worker.
+- **`OnError` also surfaces what the port used to swallow**: a finalisation that
+  could not be written to Redis, a failed lock renewal, a failed stalled check.
+  Upstream reports these through `emit('error')` from `retryIfFailed`
+  (`worker.ts:1593`). Its retry-the-finalisation loop itself is **not ported yet**:
+  the port reports the error and lets the stalled check recover the job.
+
+Events upstream has and the port does not: `drained`, `progress`, `stalled`, `ready`,
+`closing`/`closed`, `paused`/`resumed` (the port has no `Worker.Pause`),
+`lockRenewalFailed`/`locksRenewed`. Adding a field to `WorkerListener` is additive,
+so these cost nothing to grow into.
 
 ## Job features
 
@@ -161,8 +201,10 @@ and cannot grow one incidentally — `QueueEventsOptions` extends
 `Omit<QueueBaseOptions, 'telemetry'>`, so telemetry on a listener is a compile error
 there, and its own OTel instrumentation patches methods, never the EventEmitter
 callback that lives in user code. The need is real for flows: a parent killed by the
-`failParentOnFailure` cascade never reaches a processor, so the `failed` event is the
-only place an application learns the tree's outcome. The events stream carries no
+`failParentOnFailure` cascade never reaches a processor, so a `failed` event is the
+only place an application learns the tree's outcome. (Since `WithWorkerListener`,
+`OnFailed` is the better route for that outcome — it fires in-process and carries
+the job itself; the stream remains the answer when the observer is not the worker.) The events stream carries no
 trace context (no Lua script writes `tm` into it), and changing that would fork the
 vendored scripts — hence resolving it from the job instead. `WithTelemetry` on
 `NewQueueEvents` stays accepted-but-ignored (Go's shared options cannot express

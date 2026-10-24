@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -49,6 +50,7 @@ type Worker struct {
 	metricsMaxDataPoints int
 	drainDelay           time.Duration
 	id                   string
+	listener             WorkerListener
 
 	drained    bool
 	blockUntil int64
@@ -105,6 +107,7 @@ func NewWorker(name string, processor Processor, opts ...Option) (*Worker, error
 		metricsMaxDataPoints: cfg.metricsMaxDataPoints,
 		drainDelay:           defaultDrainDelay,
 		id:                   genID(),
+		listener:             cfg.listener,
 		drained:              true,
 		active:               make(map[string]string),
 		closed:               make(chan struct{}),
@@ -327,6 +330,12 @@ func (w *Worker) processJob(ctx context.Context, job *Job) {
 	pctx, span := w.queue.tel.start(pctx, SpanKindConsumer, "process")
 	span.setAttrs(map[string]any{"bullmq.queue": w.queue.name, "bullmq.job.name": job.Name, "bullmq.job.id": job.ID})
 
+	// 'active' is reported here, in the job's own goroutine, and not where upstream
+	// emits it (worker.ts:1040, in the fetch path): a listener runs inline, and
+	// inline in the fetch loop one slow handler would stall fetching for every
+	// other job. The state reported is the same, and here the drain covers it.
+	w.emitActive(pctx, job)
+
 	// Finalising runs inside the process context so the complete/fail span nests
 	// under this one, as upstream's handleCompleted/handleFailed do inside the
 	// 'process' span (worker.ts:931-1029).
@@ -335,7 +344,7 @@ func (w *Worker) processJob(ctx context.Context, job *Job) {
 		// must not run: the cascade already decided its outcome, the worker only
 		// executes it. Ported from worker.ts getUnrecoverableErrorMessage.
 		deferred := NewUnrecoverableError(job.DeferredFailure)
-		_ = job.moveToFailed(pctx, deferred, fo, false)
+		w.finishFailed(pctx, job, deferred, fo)
 		span.finish(deferred)
 		return
 	}
@@ -348,12 +357,91 @@ func (w *Worker) processJob(ctx context.Context, job *Job) {
 			span.finish(nil)
 			return
 		}
-		_ = job.moveToFailed(pctx, procErr, fo, false)
+		w.finishFailed(pctx, job, procErr, fo)
 		span.finish(procErr)
 		return
 	}
-	_ = job.moveToCompleted(pctx, result, fo, false)
+	w.finishCompleted(pctx, job, result, fo)
 	span.finish(nil)
+}
+
+// finishCompleted writes the job's success, then reports it. The order is
+// upstream's: the event comes after the move (worker.ts:1181-1184), so a listener
+// sees the state that is already in Redis, with Job.FinishedOn set.
+func (w *Worker) finishCompleted(ctx context.Context, job *Job, result any, fo finishOpts) {
+	if err := job.moveToCompleted(ctx, result, fo, false); err != nil {
+		// Upstream throws out of handleCompleted and retryIfFailed turns it into
+		// an 'error' event (worker.ts:1593). This port has no finalisation retry
+		// loop yet, so it reports and gives up on this attempt; the job stays
+		// active and the stalled check recovers it.
+		w.reportError(ctx, job, fmt.Errorf("bullmq: move job %s to completed: %w", job.ID, err))
+		return
+	}
+	w.emitCompleted(ctx, job, result)
+}
+
+// finishFailed applies the retry policy and then reports the failed attempt, as
+// upstream does after moveToFailed (worker.ts:1234-1236). The event fires on every
+// failed attempt, not only the last: Job.FinishedOn, set only once no retry is
+// left, is what separates the two.
+func (w *Worker) finishFailed(ctx context.Context, job *Job, jobErr error, fo finishOpts) {
+	if err := job.moveToFailed(ctx, jobErr, fo, false); err != nil {
+		w.reportError(ctx, job, fmt.Errorf("bullmq: move job %s to failed: %w", job.ID, err))
+		return
+	}
+	w.emitFailed(ctx, job, jobErr)
+}
+
+// The prev argument of each event is the state the job came from, exactly the
+// literal upstream passes (worker.ts:1040, :1184, :1236).
+func (w *Worker) emitActive(ctx context.Context, job *Job) {
+	if w.listener.OnActive == nil {
+		return
+	}
+	w.guard(ctx, job, "active", func() { w.listener.OnActive(ctx, job, "waiting") })
+}
+
+func (w *Worker) emitCompleted(ctx context.Context, job *Job, result any) {
+	if w.listener.OnCompleted == nil {
+		return
+	}
+	w.guard(ctx, job, "completed", func() { w.listener.OnCompleted(ctx, job, result, "active") })
+}
+
+func (w *Worker) emitFailed(ctx context.Context, job *Job, jobErr error) {
+	if w.listener.OnFailed == nil {
+		return
+	}
+	w.guard(ctx, job, "failed", func() { w.listener.OnFailed(ctx, job, jobErr, "active") })
+}
+
+// guard runs one listener callback. A panic is recovered and reported to OnError
+// rather than taking the process down: a handler is the consumer's code doing side
+// effects, and this port has no business crashing a worker over it.
+func (w *Worker) guard(ctx context.Context, job *Job, event string, call func()) {
+	defer func() {
+		if r := recover(); r != nil {
+			w.reportError(ctx, job, fmt.Errorf("bullmq: %s listener panicked: %v", event, r))
+		}
+	}()
+	call()
+}
+
+// reportError hands an error of the worker itself to OnError. A cancelled context
+// is the shutdown itself rather than a fault, so it is not reported — upstream
+// suppresses the same way while closing (worker.ts:1592).
+//
+// This is the one callback whose panic is swallowed: routing it back into OnError
+// would loop, and there is nowhere else left to report it.
+func (w *Worker) reportError(ctx context.Context, job *Job, err error) {
+	if w.listener.OnError == nil || err == nil {
+		return
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return
+	}
+	defer func() { _ = recover() }()
+	w.listener.OnError(ctx, job, err)
 }
 
 func (w *Worker) registerActive(jobID, token string) {
@@ -395,7 +483,13 @@ func (w *Worker) extendLocks(ctx context.Context) {
 	}
 	w.mu.Unlock()
 	for id, token := range snapshot {
-		_, _ = w.queue.scripts.extendLock(ctx, id, token, w.lockDuration)
+		if _, err := w.queue.scripts.extendLock(ctx, id, token, w.lockDuration); err != nil {
+			// Upstream reports a failed renewal too (worker.ts emits 'error' via
+			// retryIfFailed, plus a 'lockRenewalFailed' event carrying the ids).
+			// A lost lock means the job is about to be run twice, so it must not
+			// stay silent.
+			w.reportError(ctx, nil, fmt.Errorf("bullmq: renew lock of job %s: %w", id, err))
+		}
 	}
 }
 
@@ -412,7 +506,9 @@ func (w *Worker) stalledCheckLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			_, _ = w.queue.scripts.moveStalledJobsToWait(ctx, w.maxStalledCount, w.stalledInterval)
+			if _, err := w.queue.scripts.moveStalledJobsToWait(ctx, w.maxStalledCount, w.stalledInterval); err != nil {
+				w.reportError(ctx, nil, fmt.Errorf("bullmq: stalled check: %w", err))
+			}
 		}
 	}
 }

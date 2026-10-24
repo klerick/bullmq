@@ -132,6 +132,46 @@ q.UpsertJobScheduler(ctx, "digest", bullmq.RepeatOptions{Every: 5 * 60 * 1000}, 
 q.UpsertJobScheduler(ctx, "nightly", bullmq.RepeatOptions{Pattern: "0 3 * * *"}, "cleanup", nil, nil)
 ```
 
+## Worker events
+
+A worker reports what happens to its jobs through callbacks, registered at
+construction:
+
+```go
+w, _ := bullmq.NewWorker("emails", proc, bullmq.WithClient(client),
+	bullmq.WithWorkerListener(bullmq.WorkerListener{
+		OnFailed: func(ctx context.Context, job *bullmq.Job, err error, prev string) {
+			if job.FinishedOn == 0 {
+				return // this attempt failed, but another one is coming
+			}
+			markOrderFailed(ctx, job.ID, err) // failed for good
+		},
+		OnCompleted: func(ctx context.Context, job *bullmq.Job, result any, prev string) {
+			markOrderDone(ctx, job.ID, result)
+		},
+		OnError: func(ctx context.Context, job *bullmq.Job, err error) {
+			log.Printf("bullmq: %v", err) // the worker itself, not a job
+		},
+	}))
+```
+
+`OnFailed` fires on **every** failed attempt, as upstream does. `Job.FinishedOn`
+is the finality signal: zero while retries remain, set once the job has failed for
+good (or completed). It also fires for a parent failed by the
+`FailParentOnFailure` cascade, whose processor never runs — often the only place an
+application learns a flow's outcome.
+
+Callbacks run synchronously, in the goroutine of the job they belong to. That is
+what makes them safe for side effects: `Close` drains the jobs in flight, so a
+handler finishes instead of being cut off by a rollout. The flip side is that a
+slow handler holds its concurrency slot and `Close` for as long as it runs, just
+like a slow processor. A panic in a handler is recovered and reported to `OnError`
+rather than taking the process down.
+
+Prefer these over `QueueEvents` for side effects: they fire in the process that
+finalised the job, so nothing is lost across a restart and nothing runs twice when
+several workers share a queue.
+
 ## Cross-process events
 
 ```go
@@ -143,6 +183,11 @@ for e := range events {
 }
 _ = errs
 ```
+
+`QueueEvents` is the right tool when the observer is **not** the worker — a
+dashboard, or another service watching a queue it does not process. It reads a
+Redis stream, so delivery is at-most-once per process: events are missed while a
+process is down, and every listening process sees each event.
 
 An event carries no trace context of its own, so a handler that should appear in the
 job's trace resolves it from the job and extracts it:
