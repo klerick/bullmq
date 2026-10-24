@@ -19,6 +19,16 @@ other script (the embed takes the directory whole, and diverging from upstream's
 than 14 extra SCRIPT LOADs in one pipelined preload) but **no bindings exist** — realtime
 messaging is not ported.
 
+That feature is worth watching rather than filing away. Upstream describes it as "a messaging
+layer between the nodes of a fleet" and "the first step towards reliable cross-node job
+cancellation and worker control": nodes register with a lease and heartbeat, each gets a durable
+inbox (a stream per node), subscriptions and topic matching live in the datastore, and dead
+nodes are swept by their peers. Cancelling a running job or steering a worker needs a channel to
+the _process_, which no Lua script can provide — so once `Worker`/`Job` start using it upstream,
+it stops being a separate subsystem and becomes a parity item. It is experimental there and no
+other port (rust, python, php, elixir, dotnet) has touched it yet; those two facts are the
+trigger to revisit.
+
 ## Legend
 
 - ✅ Implemented
