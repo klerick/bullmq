@@ -120,6 +120,12 @@ Three deliberate choices, none of them wire-visible:
 - **A panic in a callback is recovered** and reported to `OnError` instead of taking
   the process down. Go has no equivalent of a thrown-away rejected promise, and a
   consumer's side-effect handler has no business crashing a worker.
+- **A finalised job leaves the lock-renewal set before its listener runs**, matching
+  upstream's `untrackJob` ahead of each handler (`worker.ts:1083-1143`), and the
+  removal is guarded by the run's own lock token. Without the guard a retried job —
+  put back in `wait` by `moveToFailed` and picked up again by the same worker while
+  the previous run is still reporting it — would have its fresh registration deleted
+  by the previous run, losing lock renewal and being run a third time.
 - **`OnError` also surfaces what the port used to swallow**: a finalisation that
   could not be written to Redis, a failed lock renewal, a failed stalled check.
   Upstream reports these through `emit('error')` from `retryIfFailed`

@@ -318,7 +318,11 @@ func (w *Worker) blockTimeout() time.Duration {
 
 func (w *Worker) processJob(ctx context.Context, job *Job) {
 	w.registerActive(job.ID, job.token)
-	defer w.unregisterActive(job.ID)
+	// A catch-all for the paths that finalise nothing (a job parking itself for its
+	// children): the finalising paths drop the job earlier, see finishCompleted and
+	// finishFailed. Upstream has the same pair — untrackJob ahead of each handler
+	// plus one in its finally block (worker.ts:1083-1143).
+	defer w.unregisterActive(job.ID, job.token)
 
 	fo := finishOpts{
 		token:            job.token,
@@ -374,6 +378,10 @@ func (w *Worker) processJob(ctx context.Context, job *Job) {
 // upstream's: the event comes after the move (worker.ts:1181-1184), so a listener
 // sees the state that is already in Redis, with Job.FinishedOn set.
 func (w *Worker) finishCompleted(ctx context.Context, job *Job, result any, fo finishOpts) {
+	// Out of the renewal set before the write, as upstream does: past this point the
+	// job is finished, and a listener must not hold a slot in there for as long as it
+	// runs. See unregisterActive for what goes wrong if it does.
+	w.unregisterActive(job.ID, job.token)
 	if err := job.moveToCompleted(ctx, result, fo, false); err != nil {
 		// Upstream throws out of handleCompleted and retryIfFailed turns it into
 		// an 'error' event (worker.ts:1593). This port has no finalisation retry
@@ -390,6 +398,10 @@ func (w *Worker) finishCompleted(ctx context.Context, job *Job, result any, fo f
 // failed attempt, not only the last: Job.FinishedOn, set only once no retry is
 // left, is what separates the two.
 func (w *Worker) finishFailed(ctx context.Context, job *Job, jobErr error, fo finishOpts) {
+	// Before the write, as in finishCompleted — and it matters most here: moveToFailed
+	// with attempts left puts the job back in wait straight away, so the next run can
+	// register itself while this one is still reporting the failure.
+	w.unregisterActive(job.ID, job.token)
 	if err := job.moveToFailed(ctx, jobErr, fo, false); err != nil {
 		w.reportError(ctx, job, fmt.Errorf("bullmq: move job %s to failed: %w", job.ID, err))
 		return
@@ -455,9 +467,16 @@ func (w *Worker) registerActive(jobID, token string) {
 	w.mu.Unlock()
 }
 
-func (w *Worker) unregisterActive(jobID string) {
+// unregisterActive drops a job from the lock-renewal set, but only while the entry
+// is still the one this run put there. The map is keyed by job id, and a retried
+// job can be picked up again — by this very worker — before the previous run has
+// finished reporting it, in which case the entry already belongs to the new run and
+// deleting it would leave that run without lock renewal.
+func (w *Worker) unregisterActive(jobID, token string) {
 	w.mu.Lock()
-	delete(w.active, jobID)
+	if w.active[jobID] == token {
+		delete(w.active, jobID)
+	}
 	w.mu.Unlock()
 }
 

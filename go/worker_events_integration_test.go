@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -559,5 +560,176 @@ func TestWorkerListenerErrorOnFailedFinalisation(t *testing.T) {
 	// And no success was reported for a write that never landed.
 	if n := len(rec.kinds("completed")); n != 0 {
 		t.Errorf("got %d completed events for a job whose finalisation failed, want 0", n)
+	}
+}
+
+// A job must leave the lock-renewal set before it is finalised, as upstream does
+// (untrackJob sits inside every retryIfFailed closure in processJob, ahead of
+// handleFailed/handleCompleted — worker.ts:1083, :1111, :1130, :1143).
+//
+// Before callbacks that window was microseconds wide, so keeping the job
+// registered until the goroutine returned was harmless. A listener widens it to
+// however long the handler runs. The damage: moveToFailed with attempts left puts
+// the job straight back in wait, this same worker picks it up under a new token,
+// and registerActive overwrites the map entry keyed by the job id — then the first
+// goroutine's deferred unregister deletes the *new* entry. The second run loses
+// lock renewal, the stalled check returns it to wait and runs it a third time while
+// the second is still going.
+func TestWorkerListenerDoesNotStripTheRetrysLockRenewal(t *testing.T) {
+	client := requireRedis(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	if err := client.FlushDB(ctx).Err(); err != nil {
+		t.Fatalf("flushdb: %v", err)
+	}
+
+	q, err := NewQueue("ev-retry-lock", WithClient(client))
+	if err != nil {
+		t.Fatalf("NewQueue: %v", err)
+	}
+	defer q.Close()
+
+	var runs atomic.Int32
+	var rec recorder
+	// The handler of the first failure outlives lockDuration, which is what used to
+	// take the retry's renewal down with it when it finally returned.
+	slowFailed := make(chan struct{}, 1)
+	listener := rec.listener()
+	inner := listener.OnFailed
+	listener.OnFailed = func(ctx context.Context, job *Job, err error, prev string) {
+		inner(ctx, job, err, prev)
+		if len(rec.kinds("failed")) == 1 {
+			slowFailed <- struct{}{}
+			time.Sleep(2 * time.Second) // > lockDuration
+		}
+	}
+
+	w, err := NewWorker("ev-retry-lock", func(ctx context.Context, j *Job) (any, error) {
+		switch runs.Add(1) {
+		case 1:
+			return nil, errors.New("boom") // one attempt left, so this retries at once
+		case 2:
+			time.Sleep(5 * time.Second) // must stay locked for all of it
+			return "ok", nil
+		default:
+			return "late", nil // a third run means the renewal was lost
+		}
+	}, WithClient(client), WithConcurrency(2),
+		WithLockDuration(1000), WithStalledInterval(500),
+		WithWorkerListener(listener))
+	if err != nil {
+		t.Fatalf("NewWorker: %v", err)
+	}
+	defer w.Close()
+	go func() { _ = w.Run(ctx) }()
+
+	job, err := q.Add(ctx, "task", nil, &JobOptions{Attempts: 2})
+	if err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	select {
+	case <-slowFailed:
+	case <-time.After(20 * time.Second):
+		t.Fatal("the first attempt never failed")
+	}
+
+	eventually(t, 30*time.Second, func() bool {
+		state, _ := q.GetJobState(ctx, job.ID)
+		return state == "completed"
+	})
+	time.Sleep(time.Second) // let a stray third run show up
+
+	if n := runs.Load(); n != 2 {
+		t.Errorf("processor ran %d times, want 2 — a third run means the retry lost its lock", n)
+	}
+	// The second run's own finalisation landed, so nothing was reported as an error.
+	if errs := rec.kinds("error"); len(errs) != 0 {
+		t.Errorf("unexpected worker errors: %v", errs)
+	}
+	if n := len(rec.kinds("completed")); n != 1 {
+		t.Errorf("got %d completed events, want 1", n)
+	}
+}
+
+// The other half of the contract, pinned directly: a finalised job is out of the
+// renewal set *before* its listener runs, as upstream untracks ahead of each
+// handler (worker.ts:1083-1143). The token guard in unregisterActive is what keeps
+// a retry's renewal alive (TestWorkerListenerDoesNotStripTheRetrysLockRenewal);
+// this is the ordering itself, which otherwise leaves the worker renewing the lock
+// of a job that is already finished for as long as the handler runs.
+//
+// Concurrency 1 on purpose: no other run can be registering the same job id while
+// the handler is inside, so the only thing that can have cleared this run's token
+// is the finalising path.
+func TestWorkerUnregistersBeforeTheListenerRuns(t *testing.T) {
+	client := requireRedis(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := client.FlushDB(ctx).Err(); err != nil {
+		t.Fatalf("flushdb: %v", err)
+	}
+
+	q, err := NewQueue("ev-untrack", WithClient(client))
+	if err != nil {
+		t.Fatalf("NewQueue: %v", err)
+	}
+	defer q.Close()
+
+	var holder atomic.Pointer[Worker] // the listener needs the worker it belongs to
+	type seen struct{ stillRegistered bool }
+	failedSeen := make(chan seen, 1)
+	completedSeen := make(chan seen, 1)
+
+	registered := func(job *Job) bool {
+		w := holder.Load()
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		return w.active[job.ID] == job.token
+	}
+
+	var runs atomic.Int32
+	w, err := NewWorker("ev-untrack", func(ctx context.Context, j *Job) (any, error) {
+		if runs.Add(1) == 1 {
+			return nil, NewUnrecoverableError("no retries for this one")
+		}
+		return "ok", nil
+	}, WithClient(client), WithConcurrency(1), WithSkipStalledCheck(),
+		WithWorkerListener(WorkerListener{
+			OnFailed: func(ctx context.Context, job *Job, err error, prev string) {
+				failedSeen <- seen{registered(job)}
+			},
+			OnCompleted: func(ctx context.Context, job *Job, result any, prev string) {
+				completedSeen <- seen{registered(job)}
+			},
+		}))
+	if err != nil {
+		t.Fatalf("NewWorker: %v", err)
+	}
+	holder.Store(w)
+	defer w.Close()
+	go func() { _ = w.Run(ctx) }()
+
+	if _, err := q.Add(ctx, "fails", nil, nil); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	select {
+	case s := <-failedSeen:
+		if s.stillRegistered {
+			t.Error("the job was still in the lock-renewal set when OnFailed ran")
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("OnFailed never ran")
+	}
+
+	if _, err := q.Add(ctx, "succeeds", nil, nil); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	select {
+	case s := <-completedSeen:
+		if s.stillRegistered {
+			t.Error("the job was still in the lock-renewal set when OnCompleted ran")
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("OnCompleted never ran")
 	}
 }
