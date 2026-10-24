@@ -338,12 +338,12 @@ func (s *scripts) runMoveToFinished(ctx context.Context, jobID string, keys []st
 }
 
 // moveToDelayed moves an active job to the delayed set for a backoff retry.
-// KEYS/ARGV from moveToDelayed-12.lua.
+// KEYS/ARGV from moveToDelayed-11.lua.
 func (s *scripts) moveToDelayed(ctx context.Context, jobID string, timestamp, delay int64, token string, fieldsToUpdate map[string]any) error {
 	keys := []string{
 		s.keys.Marker(), s.keys.Active(), s.keys.Prioritized(), s.keys.Delayed(),
 		s.keys.JobKey(jobID), s.keys.Events(), s.keys.Meta(), s.keys.Stalled(),
-		s.keys.Wait(), s.keys.Limiter(), s.keys.Paused(), s.keys.PC(),
+		s.keys.Wait(), s.keys.Limiter(), s.keys.PC(),
 	}
 	args := []any{s.keys.KeyPrefix(), strconv.FormatInt(timestamp, 10), jobID, token, delay, "0"}
 	if len(fieldsToUpdate) > 0 {
@@ -573,7 +573,7 @@ func (s *scripts) changePriority(ctx context.Context, jobID string, priority int
 }
 
 // reprocessJob moves a completed/failed job back to wait for reprocessing.
-// From reprocessJob-8.lua.
+// From reprocessJob-9.lua.
 func (s *scripts) reprocessJob(ctx context.Context, jobID, state string, lifo, resetAttemptsMade, resetAttemptsStarted bool) error {
 	pushCmd := "LPUSH"
 	if lifo {
@@ -585,7 +585,7 @@ func (s *scripts) reprocessJob(ctx context.Context, jobID, state string, lifo, r
 	}
 	keys := []string{
 		s.keys.JobKey(jobID), s.keys.Events(), s.keys.Get(state), s.keys.Wait(),
-		s.keys.Meta(), s.keys.Paused(), s.keys.Active(), s.keys.Marker(),
+		s.keys.Meta(), s.keys.Active(), s.keys.Marker(), s.keys.Prioritized(), s.keys.PC(),
 	}
 	return s.runJobMutation(ctx, "reprocessJob", jobID, "reprocessJob", keys,
 		jobID, pushCmd, propVal, state, boolArg(resetAttemptsMade), boolArg(resetAttemptsStarted))
@@ -893,9 +893,9 @@ func (s *scripts) getRanges(ctx context.Context, types []string, start, end int6
 }
 
 // getCountsPerPriority returns the job count for each requested priority.
-// From getCountsPerPriority-4.lua.
+// From getCountsPerPriority-2.lua.
 func (s *scripts) getCountsPerPriority(ctx context.Context, priorities []int) ([]int64, error) {
-	keys := []string{s.keys.Wait(), s.keys.Paused(), s.keys.Meta(), s.keys.Prioritized()}
+	keys := []string{s.keys.Wait(), s.keys.Prioritized()}
 	args := make([]any, len(priorities))
 	for i, p := range priorities {
 		args[i] = p
