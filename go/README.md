@@ -59,6 +59,49 @@ the client can come from your DI container. An injected client is never closed b
 (the equivalent of ioredis `client.duplicate()`). To build the client from options
 instead, use `WithRedisOptions`.
 
+## Default job options
+
+A queue can declare the policy its jobs get, so it is stated once instead of at
+every call site. Call options win per key, as upstream's
+`{...defaultJobOptions, ...opts}` does:
+
+```go
+q, _ := bullmq.NewQueue("emails", bullmq.WithClient(client),
+	bullmq.WithDefaultJobOptions(&bullmq.JobOptions{
+		Attempts:         3,
+		Backoff:          &bullmq.BackoffOptions{Type: "exponential", Delay: 1000},
+		RemoveOnComplete: true,
+	}))
+
+q.Add(ctx, "welcome", data, nil)                            // attempts 3, exponential backoff
+q.Add(ctx, "urgent", data, &bullmq.JobOptions{Attempts: 1}) // attempts 1, backoff still inherited
+```
+
+They apply to `Add`, `AddBulk` and `UpsertJobScheduler` — there into the stored
+template, so every iteration the scheduler produces carries them — and
+`Queue.DefaultJobOptions()` reads them back.
+
+One rule is Go-specific. Upstream spreads two objects, where a missing key and a
+key set to zero are different things; a Go struct has no missing, so a **zero
+scalar means "not set"** and inherits the default: `Attempts: 0` cannot override
+`Attempts: 3`. Pointer fields (`Backoff`, `Deduplication`, `Parent`) and the `any`
+ones (`RemoveOnComplete`, `RemoveOnFail`) do have an absent value — `nil` — so
+`RemoveOnComplete: false` _does_ override a default `true`. When a scalar has to go
+back to zero, `Extra` is the escape hatch, since it is written into the stored
+options last:
+
+```go
+q.Add(ctx, "once", data, &bullmq.JobOptions{Extra: map[string]any{"attempts": 0}})
+```
+
+The four parent-failure flags are replaced as a group: if the call picks one, the
+default's is dropped instead of being combined with it (which would be refused as
+`ErrExclusiveParentOptions`). `JobID` is never inherited — a default job id would
+collide every job of the queue onto one.
+
+`bullmq.MergeJobOptions(base, over)` is that same merge, exported, for a caller
+that keeps its own layer of defaults above the queue's.
+
 ## Flows (parent/child)
 
 ```go
@@ -77,6 +120,17 @@ fp.Add(ctx, &bullmq.FlowJob{
 
 A parent job completes only after all of its children complete; the cascade is
 handled Redis-side.
+
+Defaults for a tree are declared per queue, in the optional second argument, and
+reach every node of that queue at any depth. The parent link always comes from the
+tree, never from the defaults:
+
+```go
+fp.Add(ctx, tree, bullmq.FlowOpts{QueuesOptions: map[string]bullmq.FlowQueueOptions{
+	"tenant":  {DefaultJobOptions: &bullmq.JobOptions{Attempts: 5}},
+	"project": {DefaultJobOptions: &bullmq.JobOptions{Attempts: 2, RemoveOnComplete: true}},
+}})
+```
 
 By default a child that fails for good keeps blocking its parent: the parent stays
 in `waiting-children` forever. Set one of the four (mutually exclusive) policies on

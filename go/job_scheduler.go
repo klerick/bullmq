@@ -66,8 +66,15 @@ type JobSchedulerJSON struct {
 
 // UpsertJobScheduler creates or replaces a job scheduler and enqueues its first
 // job (immediate for a plain interval, otherwise delayed), returning that job.
+//
+// The queue's default job options are merged into the stored template
+// (queue.ts:497), so every iteration the scheduler produces carries them. The
+// merge lives here rather than in upsertJobScheduler because the worker, which
+// schedules the next iteration from the options read back off the job, must not
+// have the defaults applied a second time — upstream keeps them apart the same
+// way, by calling the job scheduler directly (worker.ts:1002).
 func (q *Queue) UpsertJobScheduler(ctx context.Context, id string, repeat RepeatOptions, name string, data any, opts *JobOptions) (*Job, error) {
-	return q.upsertJobScheduler(ctx, id, repeat, name, data, opts, true, "")
+	return q.upsertJobScheduler(ctx, id, repeat, name, data, q.jobOpts(opts), true, "")
 }
 
 // upsertJobScheduler carries the span for both entry points — the public API and

@@ -24,6 +24,9 @@ type Queue struct {
 	keys            QueueKeys
 	tel             telemetryHelper
 	backoffStrategy BackoffStrategy
+	// defaultJobOptions is the queue-wide policy merged into every job this queue
+	// adds (upstream's jobsOpts, queue.ts:189). nil when none was declared.
+	defaultJobOptions *JobOptions
 }
 
 // NewQueue creates a queue. The name must not be empty or contain ':'.
@@ -37,15 +40,45 @@ func NewQueue(name string, opts ...Option) (*Queue, error) {
 		return nil, err
 	}
 	q := &Queue{
-		name:            name,
-		prefix:          cfg.prefix,
-		conn:            conn,
-		keys:            NewQueueKeys(name, cfg.prefix),
-		tel:             telemetryHelper{t: cfg.telemetry, name: name},
-		backoffStrategy: cfg.backoffStrategy,
+		name:              name,
+		prefix:            cfg.prefix,
+		conn:              conn,
+		keys:              NewQueueKeys(name, cfg.prefix),
+		tel:               telemetryHelper{t: cfg.telemetry, name: name},
+		backoffStrategy:   cfg.backoffStrategy,
+		defaultJobOptions: cfg.defaultJobOptions,
 	}
 	q.scripts = newScripts(conn, cfg.prefix, name)
 	return q, nil
+}
+
+// DefaultJobOptions returns the options declared through WithDefaultJobOptions, or
+// nil when none were. The value is a copy, as upstream's getter is
+// (queue.ts:241-243), so reading the policy cannot change it.
+func (q *Queue) DefaultJobOptions() *JobOptions {
+	if q.defaultJobOptions == nil {
+		return nil
+	}
+	copied := *q.defaultJobOptions
+	if copied.Extra != nil {
+		extra := make(map[string]any, len(copied.Extra))
+		for k, v := range copied.Extra {
+			extra[k] = v
+		}
+		copied.Extra = extra
+	}
+	return &copied
+}
+
+// jobOpts applies the queue's defaults to the options of one add. Without
+// declared defaults the caller's options are handed on untouched, so a queue that
+// does not use them is on exactly the path it was before (rust short-circuits the
+// same way, queue.rs:369-380).
+func (q *Queue) jobOpts(o *JobOptions) *JobOptions {
+	if q.defaultJobOptions == nil {
+		return o
+	}
+	return MergeJobOptions(q.defaultJobOptions, o)
 }
 
 // Add enqueues a job and returns it with its assigned id. A nil opts is allowed.
@@ -53,7 +86,7 @@ func (q *Queue) Add(ctx context.Context, name string, data any, opts *JobOptions
 	var job *Job
 	err := q.tel.trace(ctx, SpanKindProducer, "add", func(ctx context.Context, span Span) error {
 		var e error
-		if job, e = newJob(q, name, data, opts); e != nil {
+		if job, e = newJob(q, name, data, q.jobOpts(opts)); e != nil {
 			return e
 		}
 		q.tel.injectTM(ctx, job.opts) // propagate trace context to the consumer
@@ -415,7 +448,7 @@ func (q *Queue) addBulkOnce(ctx context.Context, specs []BulkJob) (_ []*Job, app
 	cmds := make([]*redis.Cmd, len(specs))
 	if _, err = q.conn.client.Pipelined(ctx, func(pipe redis.Pipeliner) error {
 		for i, spec := range specs {
-			job, e := newJob(q, spec.Name, spec.Data, spec.Opts)
+			job, e := newJob(q, spec.Name, spec.Data, q.jobOpts(spec.Opts))
 			if e != nil {
 				return e
 			}

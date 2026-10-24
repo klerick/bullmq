@@ -16,6 +16,9 @@ type config struct {
 	telemetry       Telemetry
 	backoffStrategy BackoffStrategy
 
+	// queue-only
+	defaultJobOptions *JobOptions
+
 	// worker-only
 	concurrency     int
 	lockDuration    int64 // milliseconds
@@ -119,6 +122,19 @@ func WithPrefix(prefix string) Option {
 // spans link across processes and runtimes.
 func WithTelemetry(t Telemetry) Option {
 	return func(cfg *config) { cfg.telemetry = t }
+}
+
+// WithDefaultJobOptions declares the job options a Queue applies to every job it
+// adds, so a policy (attempts, backoff, removeOn*) is stated once per queue
+// instead of at every call site. Call options win per key; MergeJobOptions
+// documents what "unset" means for a Go struct, and Queue.DefaultJobOptions reads
+// the declared value back.
+//
+// It is a Queue option. Worker and FlowProducer take the same option slice but
+// have no defaults of their own in any port — a flow's defaults are per queue, via
+// the FlowOpts passed to FlowProducer.Add — so both ignore it.
+func WithDefaultJobOptions(o *JobOptions) Option {
+	return func(cfg *config) { cfg.defaultJobOptions = o }
 }
 
 // WithConcurrency sets how many jobs a Worker processes in parallel (default 1).

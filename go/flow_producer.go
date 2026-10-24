@@ -25,6 +25,27 @@ type JobNode struct {
 	Children []*JobNode
 }
 
+// FlowQueueOptions carries what a flow applies to the nodes that belong to one
+// queue. Upstream's shape is Omit<QueueOptions, 'connection' | 'prefix'>
+// (flow-job.ts:48-51) of which only defaultJobOptions is ever read
+// (flow-producer.ts:420); rust models that one field too
+// (flow_producer.rs:150-156), and so does this.
+type FlowQueueOptions struct {
+	// DefaultJobOptions is merged into every node of the tree whose QueueName is
+	// this entry's key, at any depth. Node options win per key — see
+	// MergeJobOptions — except for the parent link, which is always structural.
+	DefaultJobOptions *JobOptions
+}
+
+// FlowOpts is the optional second argument of FlowProducer.Add, mirroring
+// upstream's `add(flow, opts?)` (flow-producer.ts:235). A FlowProducer has no
+// defaults of its own in any port: policy is declared per queue, here, because one
+// tree spans several queues.
+type FlowOpts struct {
+	// QueuesOptions is keyed by queue name. A queue with no entry is left alone.
+	QueuesOptions map[string]FlowQueueOptions
+}
+
 // FlowProducer adds trees of parent/child jobs atomically. A parent completes only
 // after all of its children have completed (the cascade is handled Redis-side by
 // moveToFinished). Construct with the same options as Queue.
@@ -48,6 +69,55 @@ func NewFlowProducer(opts ...Option) (*FlowProducer, error) {
 // queues, so the span-name prefix belongs to the node, not to the producer.
 func (fp *FlowProducer) telFor(queueName string) telemetryHelper {
 	return telemetryHelper{t: fp.tel, name: queueName}
+}
+
+// flowPlan is everything Add settles about a tree before the first attempt: the
+// id and the effective options of every node. Both are decided once and read from
+// here afterwards, so a retry re-adds exactly the same jobs, and neither is
+// written back into the caller's FlowJob.
+type flowPlan struct {
+	ids  map[*FlowJob]string
+	opts map[*FlowJob]*JobOptions
+}
+
+// newFlowPlan walks the tree once for ids and once for options.
+func newFlowPlan(flow *FlowJob, queues map[string]FlowQueueOptions) *flowPlan {
+	plan := &flowPlan{ids: make(map[*FlowJob]string), opts: make(map[*FlowJob]*JobOptions)}
+	assignFlowIDs(flow, plan.ids)
+	resolveFlowOptions(flow, queues, plan.opts)
+	return plan
+}
+
+// resolveFlowOptions merges each node's options with the defaults of its queue,
+// into a map keyed by node. It is a pre-pass rather than something addNode does on
+// the way down for two reasons: the deduplication limits are checked before the
+// transaction and must see the merged options, and the caller's tree may not be
+// touched — python guards that invariant explicitly (flow_producer.py:103-107),
+// while rust can mutate because it owns a clone (flow_producer.rs:1111-1116).
+//
+// A node whose queue has no entry keeps its own options, pointer and all, so a
+// flow added without FlowOpts travels the path it did before.
+func resolveFlowOptions(node *FlowJob, queues map[string]FlowQueueOptions, out map[*FlowJob]*JobOptions) {
+	if node == nil {
+		return
+	}
+	if defaults := queues[node.QueueName].DefaultJobOptions; defaults != nil {
+		merged := MergeJobOptions(defaults, node.Opts)
+		// The parent link is structural: it comes from the tree walk, or for the
+		// root from its own options, and never from a queue's defaults — upstream
+		// writes `parent: parent?.parentOpts` over the merge result
+		// (flow-producer.ts:430), undefined included.
+		merged.Parent = nil
+		if node.Opts != nil {
+			merged.Parent = node.Opts.Parent
+		}
+		out[node] = merged
+	} else if node.Opts != nil {
+		out[node] = node.Opts
+	}
+	for _, child := range node.Children {
+		resolveFlowOptions(child, queues, out)
+	}
 }
 
 // assignFlowIDs gives every node that has no explicit id one, up front. The ids
@@ -109,15 +179,19 @@ func deduplicationReplace(o *JobOptions) bool {
 //     stuck while the add reports success;
 //   - no node may ask for replace (ErrDeduplicationReplaceInFlow), which upstream
 //     types out of flows altogether.
-func checkFlowDeduplication(node *FlowJob) error {
-	if deduplicationReplace(node.Opts) {
+//
+// It reads the effective options from the plan, not from the node: a
+// deduplication id arriving from a queue's defaults strands the tree exactly as an
+// explicit one would.
+func checkFlowDeduplication(node *FlowJob, plan *flowPlan) error {
+	if deduplicationReplace(plan.opts[node]) {
 		return fmt.Errorf("%w: %q in queue %q", ErrDeduplicationReplaceInFlow, node.Name, node.QueueName)
 	}
 	for _, child := range node.Children {
-		if hasDeduplication(child.Opts) {
+		if hasDeduplication(plan.opts[child]) {
 			return fmt.Errorf("%w: %q in queue %q", ErrDeduplicationNotOnRoot, child.Name, child.QueueName)
 		}
-		if err := checkFlowDeduplication(child); err != nil {
+		if err := checkFlowDeduplication(child, plan); err != nil {
 			return err
 		}
 	}
@@ -125,8 +199,22 @@ func checkFlowDeduplication(node *FlowJob) error {
 }
 
 // Add inserts a whole flow tree in a single transaction and returns the job tree.
-func (fp *FlowProducer) Add(ctx context.Context, flow *FlowJob) (*JobNode, error) {
-	if err := checkFlowDeduplication(flow); err != nil {
+//
+// opts is upstream's optional second argument (flow-producer.ts:235): it carries
+// the per-queue default job options applied to the nodes of the tree. It is
+// variadic only to stay source-compatible with Add(ctx, flow); passing more than
+// one is a mistake, and reported as ErrInvalidConfig rather than half-applied.
+func (fp *FlowProducer) Add(ctx context.Context, flow *FlowJob, opts ...FlowOpts) (*JobNode, error) {
+	if len(opts) > 1 {
+		return nil, fmt.Errorf("%w: Add accepts at most one FlowOpts, got %d", ErrInvalidConfig, len(opts))
+	}
+	var queues map[string]FlowQueueOptions
+	if len(opts) == 1 {
+		queues = opts[0].QueuesOptions
+	}
+	plan := newFlowPlan(flow, queues)
+
+	if err := checkFlowDeduplication(flow, plan); err != nil {
 		return nil, err
 	}
 
@@ -138,15 +226,12 @@ func (fp *FlowProducer) Add(ctx context.Context, flow *FlowJob) (*JobNode, error
 		return nil, err
 	}
 
-	ids := make(map[*FlowJob]string)
-	assignFlowIDs(flow, ids)
-
 	var out *JobNode
 	err = fp.telFor(flow.QueueName).trace(ctx, SpanKindProducer, "addFlow", func(ctx context.Context, span Span) error {
 		if span != nil {
 			span.SetAttributes(map[string]any{"bullmq.queue": flow.QueueName, "bullmq.flow.name": flow.Name})
 		}
-		tree, e := fp.addTree(ctx, flow, ids)
+		tree, e := fp.addTree(ctx, flow, plan)
 		if !isNoScriptErr(e) {
 			out = tree
 			return e
@@ -157,7 +242,7 @@ func (fp *FlowProducer) Add(ctx context.Context, flow *FlowJob) (*JobNode, error
 		if rerr := fp.conn.scriptCache.reload(ctx, gen); rerr != nil {
 			return rerr
 		}
-		tree, e = fp.addTree(ctx, flow, ids)
+		tree, e = fp.addTree(ctx, flow, plan)
 		out = tree
 		return e
 	})
@@ -178,12 +263,12 @@ type flowCmd struct {
 }
 
 // addTree runs one attempt: the whole tree in a single MULTI.
-func (fp *FlowProducer) addTree(ctx context.Context, flow *FlowJob, ids map[*FlowJob]string) (*JobNode, error) {
+func (fp *FlowProducer) addTree(ctx context.Context, flow *FlowJob, plan *flowPlan) (*JobNode, error) {
 	var tree *JobNode
 	var cmds []*flowCmd
 	if _, err := fp.conn.client.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
 		var e error
-		tree, e = fp.addNode(ctx, pipe, &cmds, flow, nil, ids)
+		tree, e = fp.addNode(ctx, pipe, &cmds, flow, nil, plan)
 		return e
 	}); err != nil {
 		return nil, err
@@ -237,7 +322,7 @@ func resolveFlowResults(node *JobNode, byNode map[*JobNode]*flowCmd) (*JobNode, 
 // addNode recursively adds a node and its children, threading parentOpts downward.
 // Flow jobs get a generated id up-front so children can reference the parent before
 // the pipeline executes.
-func (fp *FlowProducer) addNode(ctx context.Context, pipe redis.Pipeliner, cmds *[]*flowCmd, node *FlowJob, parent *ParentOptions, ids map[*FlowJob]string) (*JobNode, error) {
+func (fp *FlowProducer) addNode(ctx context.Context, pipe redis.Pipeliner, cmds *[]*flowCmd, node *FlowJob, parent *ParentOptions, plan *flowPlan) (*JobNode, error) {
 	prefix := node.Prefix
 	if prefix == "" {
 		prefix = fp.prefix
@@ -246,14 +331,14 @@ func (fp *FlowProducer) addNode(ctx context.Context, pipe redis.Pipeliner, cmds 
 	tel := fp.telFor(node.QueueName)
 
 	opts := JobOptions{}
-	if node.Opts != nil {
-		opts = *node.Opts
+	if o := plan.opts[node]; o != nil {
+		opts = *o // the node's options, already merged with its queue's defaults
 	}
 	if parent != nil {
 		opts.Parent = parent
 	}
 	if opts.JobID == "" {
-		opts.JobID = ids[node] // assigned once by Add, so a retry re-adds the same job
+		opts.JobID = plan.ids[node] // assigned once by Add, so a retry re-adds the same job
 	}
 
 	// One span per node, opened inside the parent node's span (and inside addFlow),
@@ -282,7 +367,7 @@ func (fp *FlowProducer) addNode(ctx context.Context, pipe redis.Pipeliner, cmds 
 			childParent := &ParentOptions{ID: job.ID, Queue: sc.keys.QualifiedName()}
 			children := make([]*JobNode, 0, len(node.Children))
 			for _, child := range node.Children {
-				cn, err := fp.addNode(ctx, pipe, cmds, child, childParent, ids)
+				cn, err := fp.addNode(ctx, pipe, cmds, child, childParent, plan)
 				if err != nil {
 					return err
 				}

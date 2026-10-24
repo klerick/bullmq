@@ -135,6 +135,146 @@ func resolveParentFailureOptions(o *JobOptions) ([]parentFailureOption, error) {
 	return enabled, nil
 }
 
+// parentFailureChosen reports whether these options pick a parent-failure policy
+// at all, through a typed field or through Extra.
+func parentFailureChosen(o *JobOptions) bool {
+	for _, p := range parentFailureOptions {
+		if p.enabled(o) {
+			return true
+		}
+	}
+	return false
+}
+
+// isParentFailureKey reports whether an Extra key belongs to the parent-failure
+// group, under either its long or its short spelling.
+func isParentFailureKey(key string) bool {
+	for _, p := range parentFailureOptions {
+		if key == p.long || key == p.short {
+			return true
+		}
+	}
+	return false
+}
+
+// MergeJobOptions overlays call options (over) onto queue defaults (base) and
+// returns the result, leaving both arguments untouched. Queue.Add, Queue.AddBulk,
+// Queue.UpsertJobScheduler and FlowProducer.Add apply it to the options they are
+// given; it is exported because a caller with its own layer of defaults
+// (application <- queue) needs exactly the same rules.
+//
+// Upstream merges two plain objects — `{...this.jobsOpts, ...opts, jobId}`
+// (queue.ts:381-385) — where a missing key and a key set to zero are different
+// things. A Go struct has no missing, so the rules are:
+//
+//   - a zero scalar (Delay, Priority, Attempts, Timestamp, Lifo, SizeLimit,
+//     KeepLogs) means "not set" and inherits the default. The cost is that a
+//     default cannot be overridden back to 0 or false. Extra is the escape hatch:
+//     it is written into the stored options last (buildOptsMap), so
+//     Extra{"attempts": 0} reaches Redis as an explicit zero;
+//   - a nil pointer (Backoff, Parent, Deduplication) inherits, and a non-nil one
+//     replaces the default whole — as spreading a nested object does, rather than
+//     merging it field by field;
+//   - RemoveOnComplete and RemoveOnFail are `any`, so they can tell an explicit
+//     false or 0 from an absent value, and do: only nil inherits;
+//   - the four parent-failure flags are replaced as one group (see below);
+//   - Extra merges per key with over winning, those keys being top-level option
+//     keys exactly like the fields around them;
+//   - JobID comes from over only, as upstream re-assigns jobId after the spread —
+//     a default job id would otherwise collide every job of the queue onto one.
+//
+// The parent-failure group is the one deliberate departure from a literal spread.
+// The four flags are a single decision about what a failing child does to its
+// parent, and at most one may be set (ErrExclusiveParentOptions). Merging them key
+// by key would let a default's failParentOnFailure survive next to a call's
+// continueParentOnFailure and fail validation, although the call had plainly
+// chosen its policy. TS and python do merge the keys and then throw (job.ts:
+// 1333-1355, job.py:66-77) — they can afford to, because there the default is
+// switched off by passing the flag as false; in Go that value is the same as "not
+// set", and this rule stands in for it.
+//
+// Pointer fields are shared with the argument they came from rather than cloned,
+// again as a spread shares object references, so the pointed-to value must not be
+// mutated afterwards. Extra is always a fresh map.
+func MergeJobOptions(base, over *JobOptions) *JobOptions {
+	if base == nil && over == nil {
+		return nil
+	}
+	if base == nil {
+		base = &JobOptions{}
+	}
+	if over == nil {
+		over = &JobOptions{}
+	}
+
+	merged := *base
+	merged.JobID = over.JobID
+
+	if over.Delay != 0 {
+		merged.Delay = over.Delay
+	}
+	if over.Priority != 0 {
+		merged.Priority = over.Priority
+	}
+	if over.Attempts != 0 {
+		merged.Attempts = over.Attempts
+	}
+	if over.Timestamp != 0 {
+		merged.Timestamp = over.Timestamp
+	}
+	if over.Lifo {
+		merged.Lifo = true
+	}
+	if over.SizeLimit != 0 {
+		merged.SizeLimit = over.SizeLimit
+	}
+	if over.KeepLogs != 0 {
+		merged.KeepLogs = over.KeepLogs
+	}
+	if over.Backoff != nil {
+		merged.Backoff = over.Backoff
+	}
+	if over.Parent != nil {
+		merged.Parent = over.Parent
+	}
+	if over.Deduplication != nil {
+		merged.Deduplication = over.Deduplication
+	}
+	if over.RemoveOnComplete != nil {
+		merged.RemoveOnComplete = over.RemoveOnComplete
+	}
+	if over.RemoveOnFail != nil {
+		merged.RemoveOnFail = over.RemoveOnFail
+	}
+
+	// Whole group or nothing: if over picks a policy — by field or through Extra —
+	// over's four fields replace base's, which for a policy set through Extra means
+	// clearing them.
+	dropBasePolicy := parentFailureChosen(over)
+	if dropBasePolicy {
+		merged.FailParentOnFailure = over.FailParentOnFailure
+		merged.ContinueParentOnFailure = over.ContinueParentOnFailure
+		merged.IgnoreDependencyOnFailure = over.IgnoreDependencyOnFailure
+		merged.RemoveDependencyOnFailure = over.RemoveDependencyOnFailure
+	}
+
+	if base.Extra != nil || over.Extra != nil {
+		extra := make(map[string]any, len(base.Extra)+len(over.Extra))
+		for k, v := range base.Extra {
+			if dropBasePolicy && isParentFailureKey(k) {
+				continue
+			}
+			extra[k] = v
+		}
+		for k, v := range over.Extra {
+			extra[k] = v
+		}
+		merged.Extra = extra
+	}
+
+	return &merged
+}
+
 // Job is a unit of work in a queue. It is created by Queue.Add / FlowProducer, or
 // reconstructed from Redis by a Worker, and passed to the processor.
 type Job struct {

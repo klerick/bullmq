@@ -41,10 +41,10 @@ trigger to revisit.
 
 | Class        | Status   | Notes                                                                     |
 | ------------ | -------- | ------------------------------------------------------------------------- |
-| Queue        | ✅       | add, getters, counts, lifecycle, schedulers, rate limit, dedup            |
+| Queue        | ✅       | add, getters, counts, lifecycle, schedulers, rate limit, dedup, defaults  |
 | Worker       | ✅       | concurrency, stalled detection, lock renewal, retry/backoff, local events |
 | Job          | ✅       | full lifecycle, flows, logs, progress, state                              |
-| FlowProducer | ✅       | parent/child trees with cascade                                           |
+| FlowProducer | ✅       | parent/child trees with cascade, per-queue default job options            |
 | JobScheduler | ✅       | interval (`Every`) and cron (`Pattern`); methods on `Queue`               |
 | QueueEvents  | ✅       | cross-process stream listener (`queue_events.go`)                         |
 | Sandbox      | ❌ (N/A) | use native goroutines                                                     |
@@ -56,6 +56,7 @@ trigger to revisit.
 | Method                                                                               | Status |
 | ------------------------------------------------------------------------------------ | ------ |
 | Add / AddBulk                                                                        | ✅     |
+| WithDefaultJobOptions / DefaultJobOptions                                            | ✅     |
 | Pause / Resume / IsPaused                                                            | ✅     |
 | Drain / Obliterate / Clean                                                           | ✅     |
 | RetryJobs / PromoteJobs                                                              | ✅     |
@@ -187,6 +188,47 @@ anywhere in a flow with `ErrDeduplicationReplaceInFlow`, as upstream types it ou
 The four parent-failure options are mutually exclusive (as in python): enabling more
 than one on the same job returns `ErrExclusiveParentOptions`. With none of them set,
 a failed child keeps blocking its parent forever — the upstream default.
+
+### Default job options
+
+`WithDefaultJobOptions` on a `Queue` (upstream `defaultJobOptions`, `queue.ts:189`) and
+`FlowOpts.QueuesOptions` on `FlowProducer.Add` (`flow-producer.ts:235`, keyed by queue
+name and applied at any depth) are both ported, merged by the exported
+`MergeJobOptions`. Applied in `Add`, `AddBulk` and `UpsertJobScheduler` (into the stored
+template, `queue.ts:497`), read back by `Queue.DefaultJobOptions()`.
+
+Upstream merges two objects with a spread, where an absent key and a key set to zero are
+distinguishable. A Go struct cannot tell them apart, so the translation has rules, and two
+of them are deliberate deviations:
+
+- a zero scalar (`Delay`, `Priority`, `Attempts`, `Timestamp`, `Lifo`, `SizeLimit`,
+  `KeepLogs`) means "not set" and inherits. A default cannot be overridden back to
+  `0`/`false`; `Extra` is the escape hatch, being written into the stored options last;
+- `nil` pointers and `nil` `any` fields inherit, so `RemoveOnComplete: false` is a value
+  and does override a default `true`, while a non-nil pointer replaces the default whole
+  rather than field by field (as spreading a nested object does);
+- **deviation 1 — the four parent-failure flags are replaced as a group.** If the call
+  picks a policy, the default's policy is dropped, fields and `Extra` keys alike. TS and
+  python merge the keys and then throw (`job.ts:1333-1355`, `job.py:66-77`); they can
+  afford to, because there a default is switched off by passing the flag as `false`, which
+  in Go is indistinguishable from "not set". This rule stands in for that.
+- **deviation 2 — a flow node never takes `Parent` from the defaults.** Upstream overwrites
+  the merged `parent` with the tree's one unconditionally (`flow-producer.ts:430`), so the
+  link stays structural; a `Parent` in a queue's defaults would otherwise make a root
+  somebody's child. `Queue.Add` does inherit a default `Parent`, which is what the spread
+  does there.
+- `JobID` comes from the call only, as upstream re-assigns `jobId` after the spread.
+
+The flow merge runs as a pre-pass over the tree (`flowPlan`), not inside `addNode`: the
+deduplication limits are checked before the transaction and must see the merged options,
+and the caller's `FlowJob` must not be mutated (python guards the same invariant,
+`flow_producer.py:103-107`; rust can mutate because it owns a clone,
+`flow_producer.rs:1111-1116`).
+
+`WithDefaultJobOptions` is a `Queue` option. `Worker` and `FlowProducer` accept the same
+option slice but have no defaults of their own in any port, so both ignore it — for a
+worker that also means the next scheduler iteration it writes is not merged a second time,
+which upstream achieves by calling the job scheduler directly (`worker.ts:1002`).
 
 Trace context is injected on every producing path — `Queue.Add`, `Queue.AddBulk`,
 `FlowProducer.Add` (per node, as upstream's addFlow/addNode do) and job schedulers.
