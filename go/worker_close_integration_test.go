@@ -3,6 +3,7 @@ package bullmq
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -169,6 +170,120 @@ func TestWorkerCloseWaitsForJobInFlight(t *testing.T) {
 	}
 
 	// The job finished for real: its finalisation ran before the clients went away.
+	state, err := q.GetJobState(ctx, job.ID)
+	if err != nil {
+		t.Fatalf("GetJobState: %v", err)
+	}
+	if state != "completed" {
+		t.Errorf("job state = %q, want completed", state)
+	}
+}
+
+// A graceful Close awaits the jobs in flight, so their locks must keep being
+// renewed until the drain finishes. v0.7.1 ran the maintenance loops on the fetch
+// context, which Close cancels first: renewal stopped at the start of the drain
+// and a job outliving lockDuration lost its lock while still running. Another
+// worker's stalled check then returned it to wait and ran it a second time, while
+// the first run was still going, and that run's finalisation failed on the lock
+// token. Upstream stops the lock extender only after whenCurrentJobsFinished
+// (worker.ts:1402-1404), and the stalled checker after that (:1418).
+func TestWorkerCloseKeepsRenewingLocksWhileDraining(t *testing.T) {
+	client := requireRedis(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	defer cancel()
+	if err := client.FlushDB(ctx).Err(); err != nil {
+		t.Fatalf("flushdb: %v", err)
+	}
+
+	const lockDuration = 1000 // ms; renewal every 500ms
+	const hold = 3 * time.Second
+
+	q, err := NewQueue("close-lock-renewal", WithClient(client))
+	if err != nil {
+		t.Fatalf("NewQueue: %v", err)
+	}
+	defer q.Close()
+
+	started := make(chan struct{})
+	var runs atomic.Int32
+	w, err := NewWorker("close-lock-renewal", func(ctx context.Context, j *Job) (any, error) {
+		runs.Add(1)
+		close(started)
+		time.Sleep(hold) // outlives lockDuration several times over
+		return "done", nil
+	}, WithClient(client), WithLockDuration(lockDuration), WithSkipStalledCheck())
+	if err != nil {
+		t.Fatalf("NewWorker: %v", err)
+	}
+	runDone := make(chan error, 1)
+	go func() { runDone <- w.Run(ctx) }()
+
+	job, err := q.Add(ctx, "task", nil, nil)
+	if err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	select {
+	case <-started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the job never started")
+	}
+
+	// A second worker, as during a rollout: it only recovers stalled jobs (it is
+	// started after the job went active, so it has nothing to fetch) and never
+	// renews a lock of its own.
+	var hijacked atomic.Int32
+	other, err := NewWorker("close-lock-renewal", func(ctx context.Context, j *Job) (any, error) {
+		hijacked.Add(1)
+		return "stolen", nil
+	}, WithClient(client), WithLockDuration(lockDuration),
+		WithStalledInterval(400), WithSkipLockRenewal())
+	if err != nil {
+		t.Fatalf("NewWorker(other): %v", err)
+	}
+	go func() { _ = other.Run(ctx) }()
+	t.Cleanup(func() { _ = other.Close() })
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- w.Close() }()
+
+	// Well past lockDuration into the drain the lock must still be there: renewal
+	// is what keeps the stalled check off a job that is simply slow.
+	time.Sleep(2 * time.Second)
+	lockKey := q.keys.JobKey(job.ID) + ":lock"
+	exists, err := client.Exists(ctx, lockKey).Result()
+	if err != nil {
+		t.Fatalf("EXISTS %s: %v", lockKey, err)
+	}
+	if exists != 1 {
+		t.Errorf("lock %s gone %s into the drain: renewal stopped too early", lockKey, 2*time.Second)
+	}
+
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("Close did not return after the job finished")
+	}
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Errorf("Run returned %v, want nil after a graceful close", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after Close")
+	}
+
+	// Give the other worker's stalled check a couple more ticks to misbehave.
+	time.Sleep(time.Second)
+	if n := hijacked.Load(); n != 0 {
+		t.Errorf("the other worker ran the job %d time(s) while it was still in flight", n)
+	}
+	if n := runs.Load(); n != 1 {
+		t.Errorf("processor ran %d times, want 1", n)
+	}
+
 	state, err := q.GetJobState(ctx, job.ID)
 	if err != nil {
 		t.Fatalf("GetJobState: %v", err)

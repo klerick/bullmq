@@ -124,6 +124,16 @@ func (w *Worker) Run(ctx context.Context) error {
 	// the blocking marker read instead of waiting out its timeout.
 	fetchCtx, stopFetch := context.WithCancel(ctx)
 	defer stopFetch()
+	// Maintenance outlives fetching. Close stops fetching but awaits the jobs in
+	// flight, and those jobs need their locks renewed for as long as they run:
+	// a lock lost mid-job lets another worker's stalled check return it to wait
+	// and run it a second time. So the loops hang off the caller's context, not
+	// the fetch context, and are stopped after the drain below — upstream's close
+	// clears the lock extender only after whenCurrentJobsFinished (worker.ts:1402-1404)
+	// and the stalled checker after that (:1418). Cancelling the caller's context
+	// is the force path and still stops everything at once.
+	maintCtx, stopMaint := context.WithCancel(ctx)
+	defer stopMaint()
 	go func() {
 		select {
 		case <-w.closed:
@@ -137,26 +147,29 @@ func (w *Worker) Run(ctx context.Context) error {
 	w.ensureClientName(ctx)
 
 	sem := make(chan struct{}, w.concurrency)
-	var wg sync.WaitGroup
+	// Two groups, because the drain is ordered: the jobs are awaited first, the
+	// maintenance loops are only then told to stop.
+	var jobs sync.WaitGroup
+	var maint sync.WaitGroup
 
 	// Background maintenance: renew locks of active jobs, and recover stalled ones.
 	if !w.skipLockRenewal {
-		wg.Add(1)
-		go func() { defer wg.Done(); w.lockRenewalLoop(fetchCtx) }()
+		maint.Add(1)
+		go func() { defer maint.Done(); w.lockRenewalLoop(maintCtx) }()
 	}
 	if !w.skipStalledCheck {
-		wg.Add(1)
-		go func() { defer wg.Done(); w.stalledCheckLoop(fetchCtx) }()
+		maint.Add(1)
+		go func() { defer maint.Done(); w.stalledCheckLoop(maintCtx) }()
 	}
 
 	seq := 0
 
+fetching:
 	for fetchCtx.Err() == nil {
 		select {
 		case sem <- struct{}{}:
 		case <-fetchCtx.Done():
-			wg.Wait()
-			return runExitErr(ctx)
+			break fetching
 		}
 
 		seq++
@@ -165,7 +178,7 @@ func (w *Worker) Run(ctx context.Context) error {
 		if err != nil {
 			<-sem
 			if fetchCtx.Err() != nil {
-				break
+				break fetching
 			}
 			time.Sleep(100 * time.Millisecond) // bounded retry on transient error
 			continue
@@ -175,15 +188,17 @@ func (w *Worker) Run(ctx context.Context) error {
 			continue
 		}
 
-		wg.Add(1)
+		jobs.Add(1)
 		go func(job *Job) {
-			defer wg.Done()
+			defer jobs.Done()
 			defer func() { <-sem }()
 			w.processJob(ctx, job)
 		}(job)
 	}
 
-	wg.Wait()
+	jobs.Wait()  // locks still being renewed while this runs
+	stopMaint()  // only now, as upstream does after whenCurrentJobsFinished
+	maint.Wait() // no maintenance call in flight when the clients are released
 	return runExitErr(ctx)
 }
 
@@ -420,7 +435,9 @@ func (w *Worker) ensureClientName(ctx context.Context) {
 // caller context is still reported as such.
 //
 // Jobs in flight keep the context they were given, so they are awaited rather than
-// aborted — the same as upstream's non-forced close. A processor that neither
+// aborted — the same as upstream's non-forced close — and their locks keep being
+// renewed for the whole drain, so a job slower than lockDuration is not mistaken
+// for stalled and picked up by another worker. A processor that neither
 // returns nor honours its context therefore holds Close for as long as it runs;
 // cancel the context passed to Run to abort such work instead. For the same reason
 // Close must not be called from inside a processor: it would wait for the very job
