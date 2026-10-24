@@ -52,6 +52,14 @@ type Worker struct {
 	drained    bool
 	blockUntil int64
 
+	// closed is shut by Close to stop a running Run loop. Without it the loop only
+	// noticed a cancelled context, so Close against a live context left it retrying
+	// a closed client every 100ms forever (upstream fixed the same shape in
+	// worker.ts: stop retrying once closing).
+	closeOnce sync.Once
+	closeErr  error
+	closed    chan struct{}
+
 	mu     sync.Mutex
 	active map[string]string // jobID -> lock token, for lock renewal
 }
@@ -96,12 +104,25 @@ func NewWorker(name string, processor Processor, opts ...Option) (*Worker, error
 		id:                   genID(),
 		drained:              true,
 		active:               make(map[string]string),
+		closed:               make(chan struct{}),
 	}, nil
 }
 
 // Run processes jobs until ctx is cancelled. It blocks, so callers typically run
 // it in a goroutine. In-flight jobs are awaited before Run returns.
 func (w *Worker) Run(ctx context.Context) error {
+	// Close stops the loop through this derived context, which also aborts the
+	// blocking marker read instead of waiting out its timeout.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		select {
+		case <-w.closed:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
 	// Register a client name so Queue.GetWorkers can discover this worker
 	// (best-effort; some managed Redis providers reject CLIENT SETNAME).
 	w.ensureClientName(ctx)
@@ -376,7 +397,21 @@ func (w *Worker) ensureClientName(ctx context.Context) {
 }
 
 // Close stops using resources, closing only clients the worker owns.
-func (w *Worker) Close() error { return w.queue.Close() }
+// Close stops the Run loop and releases the clients this worker owns. Run returns
+// context.Canceled shortly after.
+//
+// Jobs already being processed are not awaited: their Redis calls may fail against
+// the closed client, leaving them active until the stalled check recovers them.
+// Cancel the context passed to Run and wait for it to return first if that matters.
+// It is safe to call more than once — Close is often reached from both a defer and
+// a cleanup — and every call reports the result of the first.
+func (w *Worker) Close() error {
+	w.closeOnce.Do(func() {
+		close(w.closed)
+		w.closeErr = w.queue.Close()
+	})
+	return w.closeErr
+}
 
 // genID returns a random hex id used to namespace lock tokens.
 func genID() string {
