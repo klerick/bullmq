@@ -12,6 +12,12 @@ var (
 	// ErrInvalidConfig is returned for invalid queue/connection configuration.
 	ErrInvalidConfig = errors.New("bullmq: invalid config")
 
+	// ErrInvalidMaxStalledCount is returned by NewWorker for a negative
+	// maxStalledCount. Upstream validates the same way and throws
+	// ("maxStalledCount must be greater or equal than 0", worker.ts:318-321);
+	// zero is valid and means a stalled job is failed rather than recovered.
+	ErrInvalidMaxStalledCount = errors.New("bullmq: maxStalledCount must be greater or equal than 0")
+
 	// ErrWaitingChildren is a signal returned by a processor (or moveToWaitingChildren)
 	// telling the worker not to finalize the job because it now waits for children.
 	ErrWaitingChildren = errors.New("bullmq: job is waiting for children")

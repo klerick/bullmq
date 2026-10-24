@@ -75,21 +75,22 @@ trigger to revisit.
 
 ## Worker features
 
-| Feature                                           | Status   |
-| ------------------------------------------------- | -------- |
-| Configurable concurrency                          | ✅       |
-| Stalled job detection + recovery                  | ✅       |
-| Lock renewal                                      | ✅       |
-| Retry with backoff (fixed / exponential / jitter) | ✅       |
-| Rate limiting (WithLimiter)                       | ✅       |
-| WorkerName / SkipStalledCheck / SkipLockRenewal   | ✅       |
-| Job scheduler next-iteration production           | ✅       |
-| Deferred failure (failParentOnFailure cascade)    | ✅       |
-| Local lifecycle events (WithWorkerListener)       | ✅       |
-| Cross-process events (via QueueEvents)            | ✅       |
-| Telemetry / OpenTelemetry (via bullmq/otel)       | ✅       |
-| Custom backoff strategies (WithBackoffStrategy)   | ✅       |
-| Sandboxed processors                              | ❌ (N/A) |
+| Feature                                            | Status   |
+| -------------------------------------------------- | -------- |
+| Configurable concurrency                           | ✅       |
+| Stalled job detection + recovery                   | ✅       |
+| Lock renewal                                       | ✅       |
+| Retry with backoff (fixed / exponential / jitter)  | ✅       |
+| Rate limiting (WithLimiter)                        | ✅       |
+| WorkerName / SkipStalledCheck / SkipLockRenewal    | ✅       |
+| MaxStalledCount, 0 included (fail, do not recover) | ✅       |
+| Job scheduler next-iteration production            | ✅       |
+| Deferred failure (failParentOnFailure cascade)     | ✅       |
+| Local lifecycle events (WithWorkerListener)        | ✅       |
+| Cross-process events (via QueueEvents)             | ✅       |
+| Telemetry / OpenTelemetry (via bullmq/otel)        | ✅       |
+| Custom backoff strategies (WithBackoffStrategy)    | ✅       |
+| Sandboxed processors                               | ❌ (N/A) |
 
 ### Worker events
 

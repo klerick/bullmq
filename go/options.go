@@ -17,10 +17,13 @@ type config struct {
 	backoffStrategy BackoffStrategy
 
 	// worker-only
-	concurrency          int
-	lockDuration         int64 // milliseconds
-	stalledInterval      int64 // milliseconds
-	maxStalledCount      int
+	concurrency     int
+	lockDuration    int64 // milliseconds
+	stalledInterval int64 // milliseconds
+	// maxStalledCount is a pointer because 0 is a meaningful value upstream ("fail
+	// a stalled job instead of recovering it"), so an int could not tell it apart
+	// from "not set".
+	maxStalledCount      *int
 	limiter              *Limiter
 	workerName           string
 	skipStalledCheck     bool
@@ -135,9 +138,12 @@ func WithStalledInterval(ms int64) Option {
 }
 
 // WithMaxStalledCount sets how many times a job may be recovered from the stalled
-// state before being failed (default 1).
+// state before being failed (default 1). Zero is valid and means a stalled job is
+// failed on the first detection rather than recovered
+// (moveStalledJobsToWait-9.lua:96). A negative value makes NewWorker return
+// ErrInvalidMaxStalledCount, as upstream throws for it (worker.ts:318-321).
 func WithMaxStalledCount(n int) Option {
-	return func(cfg *config) { cfg.maxStalledCount = n }
+	return func(cfg *config) { cfg.maxStalledCount = &n }
 }
 
 // WithLimiter rate-limits the worker to max jobs per durationMs milliseconds.

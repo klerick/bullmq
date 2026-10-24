@@ -89,9 +89,14 @@ func NewWorker(name string, processor Processor, opts ...Option) (*Worker, error
 	if stalledInterval == 0 {
 		stalledInterval = defaultStalledInterval
 	}
-	maxStalledCount := cfg.maxStalledCount
-	if maxStalledCount == 0 {
-		maxStalledCount = defaultMaxStalledCount
+	// The default applies only when the option was not given: 0 is a value in its
+	// own right, not an absent one.
+	maxStalledCount := defaultMaxStalledCount
+	if cfg.maxStalledCount != nil {
+		if *cfg.maxStalledCount < 0 {
+			return nil, fmt.Errorf("%w, got %d", ErrInvalidMaxStalledCount, *cfg.maxStalledCount)
+		}
+		maxStalledCount = *cfg.maxStalledCount
 	}
 	return &Worker{
 		queue:                q,
