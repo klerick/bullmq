@@ -78,8 +78,10 @@ q.Add(ctx, "urgent", data, &bullmq.JobOptions{Attempts: 1}) // attempts 1, backo
 ```
 
 They apply to `Add`, `AddBulk` and `UpsertJobScheduler` — there into the stored
-template, so every iteration the scheduler produces carries them — and
-`Queue.DefaultJobOptions()` reads them back.
+template, so every iteration the scheduler produces carries them: a worker builds
+the next iteration out of the options of the one it has just fetched, which are the
+template's. The exception is the trace context, which each iteration gets fresh
+(see FEATURE_PARITY.md). `Queue.DefaultJobOptions()` reads the declared options back.
 
 One rule is Go-specific. Upstream spreads two objects, where a missing key and a
 key set to zero are different things; a Go struct has no missing, so a **zero

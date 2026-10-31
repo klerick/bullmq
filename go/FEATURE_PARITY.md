@@ -230,6 +230,21 @@ option slice but have no defaults of their own in any port, so both ignore it �
 worker that also means the next scheduler iteration it writes is not merged a second time,
 which upstream achieves by calling the job scheduler directly (`worker.ts:1002`).
 
+Every iteration of a scheduler carries them, not just the first. The options of a produced
+iteration _are_ the template for the next one: the worker hands the whole of the fetched
+job's options back to the scheduler, as upstream does (`worker.ts:1000-1011`, spread in
+`getNextJobOpts`), and only the per-iteration keys (`jobId`, `delay`, `timestamp`,
+`prevMillis`, `repeatJobKey`, `repeat`) are overwritten. There is no field list to keep in
+step with new options — the one that existed carried `attempts` and `priority` only, which
+is how a schedule silently lost its `removeOn*` and its `backoff` from the second
+iteration on (the trace context is the one thing deliberately not inherited — see the
+divergence register). Nothing in the scheduler's
+stored hash is consulted for this: `updateJobScheduler-12.lua` takes the iteration's
+options from `ARGV[4]` as given, so completeness is entirely the client's job. One
+consequence: an upgrade does not heal a schedule already running on a lossy chain, since
+options travel job→job — re-declaring the scheduler (`UpsertJobScheduler`, which most
+applications do at boot) replaces both the hash and the pending iteration.
+
 Trace context is injected on every producing path — `Queue.Add`, `Queue.AddBulk`,
 `FlowProducer.Add` (per node, as upstream's addFlow/addNode do) and job schedulers.
 Upstream's `telemetry.omitContext` opt-out is **not** ported: set `JobOptions.Extra["tm"]`
@@ -295,6 +310,111 @@ Two deliberate deviations from upstream's telemetry, both verified against Node:
 Verified against Node BullMQ (pinned to the rawScripts version) in both directions:
 add ↔ read, produce ↔ consume, flow cascade, cron next-times (vs `cron-parser`),
 and QueueEvents.
+
+## Divergence register
+
+Every place the port behaves differently from upstream on purpose, plus everything
+porting turned up that is wrong in upstream or in a sibling port. This is the record —
+nothing here is filed as an upstream issue, so it lives where the next person reading
+this port will look. The reasoning sits next to each feature in the sections above; these
+are the entries, in one list, with the test that pins each one. Bugs where the _port_ was
+simply wrong about upstream are not here: those are in git history.
+
+### Deliberate deviations
+
+1. **A zero scalar means "not set" when options are merged.** Upstream spreads two
+   objects, where an absent key and a key set to zero differ; a Go struct has no absent.
+   So `Attempts: 0` inherits a default `3`, and `Extra` (written last) is the escape
+   hatch. Pointer and `any` fields do have an absent value, so `RemoveOnComplete: false`
+   overrides. — `TestMergeJobOptionsZeroDoesNotOverrideButExtraDoes`
+2. **The four parent-failure flags are replaced as a group.** Upstream merges the keys and
+   then throws on a combination (`job.ts:1333-1355`, `job.py:66-77`), which it can afford
+   because there a default is switched off by passing `false`. — `TestMergeJobOptionsReplacesParentFailureAsAGroup`
+3. **A flow node never takes `Parent` from a queue's defaults.** Upstream overwrites the
+   merged `parent` with the tree's one unconditionally (`flow-producer.ts:430`); a
+   `Parent` in defaults would otherwise make a root somebody's child. `Queue.Add` does
+   inherit one, as the spread there does. — `TestFlowAddQueuesOptionsNeverProvideParent`
+4. **A scheduler iteration does not inherit the previous one's trace context.** Upstream
+   prefers an existing `opts.telemetry.metadata` over the producing span's
+   (`job-scheduler.ts:220-232`) and the worker passes the fetched job's options whole, so
+   every iteration of a schedule becomes a child of the first one's trace — for a 30s
+   schedule, one unbounded trace. Each iteration is traced by the worker that produced it
+   instead. Cost: a `tm` pinned through `Extra` applies to the iteration that declared it,
+   not to later ones. — `TestSchedulerTickDoesNotInheritTraceContext`
+5. **Flow nodes declared without options still propagate trace context.** Upstream guards
+   the injection with `&& opts` (`flow-producer.ts:394`), which no other producing path
+   does; see upstream bug 1. — `TestInteropFlowTelemetryMetadata`
+6. **The failure re-stamp of `tm` is not ported.** Upstream writes it to a hash field no
+   reader looks at; see upstream bug 2. The port skips the dead write.
+7. **`telemetry.omitContext` is not ported.** `JobOptions.Extra["tm"]` set explicitly
+   overrides what a job propagates, since an explicit value always wins.
+8. **Deduplication below a flow root is refused** (`ErrDeduplicationNotOnRoot`), and
+   `Replace` anywhere in a flow (`ErrDeduplicationReplaceInFlow`, which upstream types
+   out). The first is upstream bug 4. — `TestFlowAddRejectsDeduplicationFromQueuesOptions`
+   and the dedup flow tests
+9. **A deduplicated flow add reports what it actually wrote**: the holder's id and no
+   children, because a deduplicated root stores nothing. Upstream leaves the children in
+   the returned tree carrying ids that name nothing; see upstream bug 5.
+10. **`WithTelemetry` on `NewQueueEvents` is accepted and ignored.** Upstream makes it a
+    compile error (`QueueEventsOptions extends Omit<QueueBaseOptions, 'telemetry'>`),
+    which Go's one shared option slice cannot express. The listener opens no spans. —
+    `TestQueueEventsTelemetryOptionIsInert`
+11. **The Lua scripts are committed**, unlike in `rust/` and `python/`. A Go module is
+    served straight from a git tag, so anything untracked never reaches the consumer.
+12. **One extension beyond upstream:** `Job.TelemetryMetadata()` and
+    `Queue.GetJobTelemetryMetadata()` expose the trace context a job carries, so a process
+    reacting to a queue _event_ can continue the job's trace. Upstream has no equivalent
+    and cannot grow one incidentally (see the telemetry section).
+
+### Known divergences, left as they are
+
+- **An interval scheduler stores a client-side guess in `opts.prevMillis`.** For `every`
+  the Lua recomputes the next millis from the repeat zset, so the stored value can name
+  the current iteration rather than the next; upstream stores none at all there (its
+  `nextMillis` stays undefined unless a cron pattern is set). Nothing reads it: not the
+  scripts, not the port.
+- **`opts.prevMillis` is not used as the reference when computing a cron next-millis.**
+  Upstream does `now = max(now, prevMillis)` (`job-scheduler.ts:186-188`) and rust uses
+  `prev_millis`; the port computes from `now`. They differ only for an iteration fetched
+  before its scheduled millisecond.
+
+### Upstream bugs found while porting
+
+All still present in 6.4.1.
+
+1. **Flow nodes declared without `opts` lose the trace context.** `addNode` attaches the
+   propagation metadata only when `node.opts` exists (`flow-producer.ts:394`), so
+   `{ name, queueName, data }` stores no `tm` and its consumer opens a new root trace.
+   `queue.ts:324`, `queue.ts:409` and `job-scheduler.ts:196` all inject regardless.
+   Dropping `&& opts` looks like the whole fix.
+2. **The telemetry metadata written on failure is never read back.** `Job.moveToFailed`
+   HMSETs `tm` as a top-level hash field, but every reader takes `tm` out of the stored
+   opts JSON (`optsFromJSON`; `raw2jobData` has no `raw.tm`). A retried job continues from
+   the original producer span. Either map it back or stop writing it.
+3. **Every iteration of a schedule shares one trace, forever.** The worker hands the
+   fetched job's options to the scheduler whole (`worker.ts:1000-1011`) and the injection
+   keeps an existing `opts.telemetry.metadata` (`job-scheduler.ts:220-232`), so `tm`
+   propagates from iteration to iteration. A 30s schedule produces one trace that never
+   ends; a sampler or backend that holds a trace's spans will hold them all.
+4. **Deduplication on a non-root flow node silently corrupts the parent.** On a hit the add
+   scripts return before linking the existing job into the new parent's dependencies, so
+   the parent waits forever on a child that never joins it — while the add reports success.
+5. **A deduplicated flow root returns children ids that name nothing.** Nothing below the
+   root is created, but the returned tree still carries generated ids; upstream only ever
+   inspects the root's result, so it does not notice.
+
+### Found in sibling ports
+
+Read as spec, so where they are wrong matters.
+
+- **rust loses most job options on every scheduler iteration** — the same class of bug
+  this port had: `worker.rs::pack_update_scheduler_opts` hand-picks `repeat`,
+  `repeatJobKey`, `attempts`, `backoff`, `removeOnComplete`, `removeOnFail` and
+  `priority`, dropping `keepLogs`, `deduplication`, `lifo`, the parent-failure flags and
+  anything else.
+- **rust does not validate the exclusivity of the parent-failure flags**, which TS
+  (`job.ts:1333-1355`) and python (`job.py:66-77`) do. Enabling two there is accepted and
+  resolved by whatever the Lua reads first.
 
 ## Intentionally out of scope
 

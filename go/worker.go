@@ -265,7 +265,8 @@ func (w *Worker) moveToActive(ctx context.Context, token string) (*Job, error) {
 	// the Node worker (it schedules the next run right after fetching the current).
 	if isJobScheduler(job.RepeatJobKey) {
 		repeat := repeatFromOpts(job.opts["repeat"])
-		_, _ = w.queue.upsertJobScheduler(ctx, job.RepeatJobKey, repeat, job.Name, job.Data, jobOptionsFromMap(job.opts), false, job.ID)
+		tmpl := schedulerTickTemplate(job.opts)
+		_, _, _ = w.queue.upsertSchedulerTemplate(ctx, job.RepeatJobKey, repeat, job.Name, job.Data, tmpl, false, job.ID)
 	}
 	return job, nil
 }

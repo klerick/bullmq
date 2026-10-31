@@ -69,25 +69,81 @@ type JobSchedulerJSON struct {
 //
 // The queue's default job options are merged into the stored template
 // (queue.ts:497), so every iteration the scheduler produces carries them. The
-// merge lives here rather than in upsertJobScheduler because the worker, which
+// merge lives here rather than in upsertSchedulerTemplate because the worker, which
 // schedules the next iteration from the options read back off the job, must not
 // have the defaults applied a second time — upstream keeps them apart the same
 // way, by calling the job scheduler directly (worker.ts:1002).
 func (q *Queue) UpsertJobScheduler(ctx context.Context, id string, repeat RepeatOptions, name string, data any, opts *JobOptions) (*Job, error) {
-	return q.upsertJobScheduler(ctx, id, repeat, name, data, q.jobOpts(opts), true, "")
+	opts = q.jobOpts(opts)
+	tmpl := map[string]any{}
+	if opts != nil {
+		failurePolicy, err := resolveParentFailureOptions(opts)
+		if err != nil {
+			return nil, err
+		}
+		tmpl = buildOptsMap(opts, failurePolicy)
+	}
+	jobID, merged, err := q.upsertSchedulerTemplate(ctx, id, repeat, name, data, tmpl, true, "")
+	if err != nil || jobID == "" {
+		return nil, err
+	}
+	job, err := newJob(q, name, data, opts)
+	if err != nil {
+		return nil, err
+	}
+	job.ID = jobID
+	schedulerJobTM(job, merged)
+	return job, nil
 }
 
-// upsertJobScheduler carries the span for both entry points — the public API and
-// the worker scheduling the next iteration — so every produced job propagates the
-// trace it was produced under, as upstream's single traced method does.
-func (q *Queue) upsertJobScheduler(ctx context.Context, id string, repeat RepeatOptions, name string, data any, opts *JobOptions, override bool, producerID string) (_ *Job, err error) {
+// schedulerTickTemplate turns the options of a produced iteration into the template
+// for the next one. Every option carries over — they are the template's options,
+// merged with the queue's defaults back when the scheduler was declared — which is
+// what upstream does by handing the whole of job.opts to the scheduler
+// (worker.ts:1000-1011, python/bullmq/worker.py:346) and spreading it
+// (job-scheduler.ts:318-357). The per-iteration keys (jobId, delay, timestamp,
+// prevMillis, repeatJobKey, repeat) travel along and are overwritten by the
+// overlay, exactly as they are there.
+//
+// The one exception is `tm`, deliberately dropped: injectTM keeps an existing trace
+// context rather than replacing it (upstream's injection has the same precedence,
+// job-scheduler.ts:220-232), so passing it on would make every iteration of a
+// schedule a child of the first one's trace, forever — for a 30s schedule, one
+// unbounded trace. Each iteration is instead traced by the worker that produced it.
+// The cost: a `tm` pinned through Extra applies to the iteration that declared it,
+// not to the ones after it.
+//
+// The returned map is a copy: the worker reads job.opts again after rescheduling,
+// to take its process span's parent from it.
+func schedulerTickTemplate(opts map[string]any) map[string]any {
+	tmpl := make(map[string]any, len(opts))
+	for key, value := range opts {
+		if key == "tm" {
+			continue
+		}
+		tmpl[key] = value
+	}
+	return tmpl
+}
+
+// upsertSchedulerTemplate writes the scheduler and materialises its next iteration
+// out of tmpl, the options every iteration carries. It is the shared core of both
+// entry points — the public API, which builds tmpl from typed options, and the
+// worker, which inherits it from the iteration it has just fetched — and carries
+// the span for both, so every produced job propagates the trace it was produced
+// under, as upstream's single traced method does.
+//
+// It returns the id of the produced job, empty when nothing was written (the
+// iteration limit or the end date was reached, or another worker had already
+// materialised this iteration), and the options it was stored with.
+func (q *Queue) upsertSchedulerTemplate(ctx context.Context, id string, repeat RepeatOptions, name string, data any, tmpl map[string]any, override bool, producerID string) (_ string, _ map[string]any, err error) {
 	ctx, span := q.tel.start(ctx, SpanKindProducer, "upsertJobScheduler")
 	defer func() { span.finish(err) }()
 	switch {
 	case repeat.Pattern != "" && repeat.Every > 0:
-		return nil, fmt.Errorf("%w: both .Pattern and .Every are set for a scheduler", ErrInvalidConfig)
+		return "", nil, fmt.Errorf("%w: both .Pattern and .Every are set for a scheduler", ErrInvalidConfig)
 	case repeat.Pattern == "" && repeat.Every == 0:
-		return nil, fmt.Errorf("%w: either .Pattern or .Every must be set for a scheduler", ErrInvalidConfig)
+		return "", nil, fmt.Errorf("%w: either .Pattern or .Every must be set for a scheduler", ErrInvalidConfig)
 	}
 
 	now := nowMillis()
@@ -96,14 +152,16 @@ func (q *Queue) upsertJobScheduler(ctx context.Context, id string, repeat Repeat
 		iterationCount = repeat.Count + 1
 	}
 	if repeat.Limit > 0 && iterationCount > repeat.Limit {
-		return nil, nil
+		return "", nil, nil
 	}
 	if repeat.EndDate > 0 && now > repeat.EndDate {
-		return nil, nil
+		return "", nil, nil
 	}
 
 	// nextMillis. For a cron pattern it is computed client-side (the Lua trusts it);
-	// for an interval the Lua recomputes it, but we still pass a value.
+	// for an interval the Lua recomputes it from the repeat zset, so the value passed
+	// here is only a guess — it still reaches the stored opts as prevMillis, where
+	// nothing reads it (upstream leaves it undefined for an interval entirely).
 	var nextMillis int64
 	if repeat.Pattern != "" {
 		after := now
@@ -112,7 +170,7 @@ func (q *Queue) upsertJobScheduler(ctx context.Context, id string, repeat Repeat
 		}
 		nm, err := cronNextMillis(repeat.Pattern, repeat.Tz, after)
 		if err != nil {
-			return nil, err
+			return "", nil, err
 		}
 		nextMillis = nm
 		if nextMillis < now {
@@ -137,15 +195,6 @@ func (q *Queue) upsertJobScheduler(ctx context.Context, id string, repeat Repeat
 	delay := nextMillis + offset - now
 	if delay < 0 {
 		delay = 0
-	}
-
-	tmpl := map[string]any{}
-	if opts != nil {
-		failurePolicy, err := resolveParentFailureOptions(opts)
-		if err != nil {
-			return nil, err
-		}
-		tmpl = buildOptsMap(opts, failurePolicy)
 	}
 
 	merged := map[string]any{}
@@ -185,7 +234,7 @@ func (q *Queue) upsertJobScheduler(ctx context.Context, id string, repeat Repeat
 
 	dataJSON, err := marshalJSON(dataOrEmpty(data))
 	if err != nil {
-		return nil, err
+		return "", nil, err
 	}
 
 	if override {
@@ -216,33 +265,21 @@ func (q *Queue) upsertJobScheduler(ctx context.Context, id string, repeat Repeat
 		jobId, _, err := q.scripts.addJobScheduler(ctx, id, nextMillis, string(dataJSON),
 			encodeOpts(tmpl), schedulerOpts, encodeOpts(merged), "")
 		if err != nil {
-			return nil, err
+			return "", nil, err
 		}
-		job, err := newJob(q, name, data, opts)
-		if err != nil {
-			return nil, err
-		}
-		job.ID = jobId
-		schedulerJobTM(job, merged)
-		span.setAttrs(map[string]any{"bullmq.job.scheduler.id": id, "bullmq.job.id": job.ID})
-		return job, nil
+		span.setAttrs(map[string]any{"bullmq.job.scheduler.id": id, "bullmq.job.id": jobId})
+		return jobId, merged, nil
 	}
 
 	jobId, err := q.scripts.updateJobSchedulerNextMillis(ctx, id, nextMillis, string(dataJSON), encodeOpts(merged), producerID)
 	if err != nil {
-		return nil, err
+		return "", nil, err
 	}
 	if jobId == "" {
-		return nil, nil
+		return "", nil, nil
 	}
-	job, err := newJob(q, name, data, opts)
-	if err != nil {
-		return nil, err
-	}
-	job.ID = jobId
-	schedulerJobTM(job, merged)
-	span.setAttrs(map[string]any{"bullmq.job.scheduler.id": id, "bullmq.job.id": job.ID})
-	return job, nil
+	span.setAttrs(map[string]any{"bullmq.job.scheduler.id": id, "bullmq.job.id": jobId})
+	return jobId, merged, nil
 }
 
 // schedulerJobTM mirrors onto the returned handle the trace context that was
@@ -337,13 +374,4 @@ func repeatFromOpts(v any) RepeatOptions {
 		r.Tz = tz
 	}
 	return r
-}
-
-// jobOptionsFromMap reconstructs a minimal JobOptions from a stored opts map (the
-// template fields the next iteration should carry).
-func jobOptionsFromMap(m map[string]any) *JobOptions {
-	return &JobOptions{
-		Attempts: int(toInt64(m["attempts"])),
-		Priority: int(toInt64(m["priority"])),
-	}
 }
