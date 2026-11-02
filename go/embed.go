@@ -8,8 +8,12 @@ import (
 )
 
 // commandsFS holds the include-resolved Lua commands, copied from rawScripts by the
-// package.json `copy:lua:go` step (cpx rawScripts/*.lua -> go/commands). The directory
-// is gitignored; CI regenerates it before building. This mirrors rust's include_str!.
+// package.json `copy:lua:go` step (cpx rawScripts/*.lua -> go/commands). Unlike rust/
+// and python/, which gitignore their copy and regenerate it when they release, this
+// one is committed: a Go module is served straight from a git tag, so anything
+// untracked never reaches the consumer (FEATURE_PARITY.md, deviation 11). The embed
+// directive is its own guard — a missing copy fails the build with "pattern
+// commands/*.lua: no matching files found". Otherwise this mirrors rust's include_str!.
 //
 //go:embed commands/*.lua
 var commandsFS embed.FS
